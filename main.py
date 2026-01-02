@@ -29,6 +29,7 @@ from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_sco
 from sklearn.preprocessing import label_binarize
 from MedViT import MedViT_tiny, MedViT_small, MedViT_base, MedViT_large
 #from MedViTV1 import MedViT_small, MedViT_base, MedViT_large
+from MedViTv3 import MedViTv3_tiny, MedViTv3_small, MedViTv3_base, MedViTv3_large
 from datetime import datetime
 
 
@@ -36,14 +37,22 @@ model_classes = {
     'MedViT_tiny': MedViT_tiny,
     'MedViT_small': MedViT_small,
     'MedViT_base': MedViT_base,
-    'MedViT_large': MedViT_large
+    'MedViT_large': MedViT_large,
+    'MedViTv3_tiny': MedViTv3_tiny,
+    'MedViTv3_small': MedViTv3_small,
+    'MedViTv3_base': MedViTv3_base,
+    'MedViTv3_large': MedViTv3_large
 }
 
 model_urls = {
     "MedViT_tiny": "https://dl.dropbox.com/scl/fi/496jbihqp360jacpji554/MedViT_tiny.pth?rlkey=6hb9froxugvtg8l639jmspxfv&st=p9ef06j8&dl=0",
     "MedViT_small": "https://dl.dropbox.com/scl/fi/6nnec8hxcn5da6vov7h2a/MedViT_small.pth?rlkey=yf5twra1cv6ep2oqr79tbzyg5&st=rwx5hy8z&dl=0",
     "MedViT_base": "https://dl.dropbox.com/scl/fi/q5c0u515dd4oc8j55bhi9/MedViT_base.pth?rlkey=5duw3uomnsyjr80wykvedjhas&st=incconx4&dl=0",
-    "MedViT_large": "https://dl.dropbox.com/scl/fi/owujijpsl6vwd481hiydd/MedViT_large.pth?rlkey=cx9lqb4a1288nv4xlmux13zoe&st=kcehwbrb&dl=0"
+    "MedViT_large": "https://dl.dropbox.com/scl/fi/owujijpsl6vwd481hiydd/MedViT_large.pth?rlkey=cx9lqb4a1288nv4xlmux13zoe&st=kcehwbrb&dl=0",
+    "MedViTv3_tiny": "https://dl.dropbox.com/scl/fi/496jbihqp360jacpji554/MedViT_tiny.pth?rlkey=6hb9froxugvtg8l639jmspxfv&st=p9ef06j8&dl=0",
+    "MedViTv3_small": "https://dl.dropbox.com/scl/fi/6nnec8hxcn5da6vov7h2a/MedViT_small.pth?rlkey=yf5twra1cv6ep2oqr79tbzyg5&st=rwx5hy8z&dl=0",
+    "MedViTv3_base": "https://dl.dropbox.com/scl/fi/q5c0u515dd4oc8j55bhi9/MedViT_base.pth?rlkey=5duw3uomnsyjr80wykvedjhas&st=incconx4&dl=0",
+    "MedViTv3_large": "https://dl.dropbox.com/scl/fi/owujijpsl6vwd481hiydd/MedViT_large.pth?rlkey=cx9lqb4a1288nv4xlmux13zoe&st=kcehwbrb&dl=0"
 }
 
 def download_checkpoint(url, path):
@@ -426,7 +435,7 @@ def main(args):
     # Select model
     if model_name in model_classes:
         model_class = model_classes[model_name]
-        net = model_class(num_classes=nb_classes, use_kmp_glu=args.use_kmp_glu).cuda()
+        net = model_class(num_classes=nb_classes, use_kmp_glu=args.use_kmp_glu, use_coord=args.use_coord, use_wavkan=args.use_wavkan).cuda()
         if pretrained:
             checkpoint_path = args.checkpoint_path
             if not os.path.exists(checkpoint_path):
@@ -483,6 +492,8 @@ if __name__ == '__main__':
     parser.add_argument('--pretrained', type=lambda x: bool(strtobool(x)), default=False, help="Whether to use pretrained weights (True/False).")
     parser.add_argument('--checkpoint_path', type=str, default='./checkpoint/MedViT_tiny.pth', help='Path to the checkpoint file.')
     parser.add_argument('--use_kmp_glu', type=lambda x: bool(strtobool(x)), default=False, help='Enable KAN-MLP parallel GLU fusion in GFP blocks (default: False).')
+    parser.add_argument('--use_coord', type=lambda x: bool(strtobool(x)), default=False, help='Enable Coordinate Attention in MHCA (default: False).')
+    parser.add_argument('--use_wavkan', type=lambda x: bool(strtobool(x)), default=False, help='Use WavKAN instead of FasterKAN (default: False).')
 
     args = parser.parse_args()
     main(args)

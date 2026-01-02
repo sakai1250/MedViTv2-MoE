@@ -1,52 +1,41 @@
 """
-Author: Omid Nejati
-Email: omid_nejaty@alumni.iust.ac.ir
-
-MedViTV2: A Robust Vision Transformer for Generalized Medical Image Classification.
+MedViTv3: Improved MedViT with Parallel Global/Local Branches and Cleaned Architecture.
+Supports WavKAN integration.
 """
 from functools import partial
 import math
-from fasterkan import FasterKAN as KAN, SplineLinear
 import torch
+import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 from einops import rearrange
 from timm.models.layers import DropPath, trunc_normal_
 from timm.models.registry import register_model
-from torch import nn
 import natten
 from natten import NeighborhoodAttention2D as NeighborhoodAttention
-is_natten_post_017 = hasattr(natten, "context")
-#from utils import merge_pre_bn
+from fasterkan import FasterKAN, SplineLinear
+try:
+    from wavkan import WavKAN
+except ImportError:
+    WavKAN = None
 
+is_natten_post_017 = hasattr(natten, "context")
 
 NORM_EPS = 1e-5
 
-
 def merge_pre_bn(module, pre_bn_1, pre_bn_2=None):
-    """ Merge pre BN to reduce inference runtime.
-    """
+    """ Merge pre BN to reduce inference runtime. """
     weight = module.weight.data
     if module.bias is None:
         zeros = torch.zeros(module.out_channels, device=weight.device).type(weight.type())
         module.bias = nn.Parameter(zeros)
     bias = module.bias.data
     if pre_bn_2 is None:
-        assert pre_bn_1.track_running_stats is True, "Unsupport bn_module.track_running_stats is False"
-        assert pre_bn_1.affine is True, "Unsupport bn_module.affine is False"
-
         scale_invstd = pre_bn_1.running_var.add(pre_bn_1.eps).pow(-0.5)
         extra_weight = scale_invstd * pre_bn_1.weight
         extra_bias = pre_bn_1.bias - pre_bn_1.weight * pre_bn_1.running_mean * scale_invstd
     else:
-        assert pre_bn_1.track_running_stats is True, "Unsupport bn_module.track_running_stats is False"
-        assert pre_bn_1.affine is True, "Unsupport bn_module.affine is False"
-
-        assert pre_bn_2.track_running_stats is True, "Unsupport bn_module.track_running_stats is False"
-        assert pre_bn_2.affine is True, "Unsupport bn_module.affine is False"
-
         scale_invstd_1 = pre_bn_1.running_var.add(pre_bn_1.eps).pow(-0.5)
         scale_invstd_2 = pre_bn_2.running_var.add(pre_bn_2.eps).pow(-0.5)
-
         extra_weight = scale_invstd_1 * pre_bn_1.weight * scale_invstd_2 * pre_bn_2.weight
         extra_bias = scale_invstd_2 * pre_bn_2.weight *(pre_bn_1.bias - pre_bn_1.weight * pre_bn_1.running_mean * scale_invstd_1 - pre_bn_2.running_mean) + pre_bn_2.bias
 
@@ -54,7 +43,6 @@ def merge_pre_bn(module, pre_bn_1, pre_bn_2=None):
         extra_bias = weight @ extra_bias
         weight.mul_(extra_weight.view(1, weight.size(1)).expand_as(weight))
     elif isinstance(module, nn.Conv2d):
-        assert weight.shape[2] == 1 and weight.shape[3] == 1
         weight = weight.reshape(weight.shape[0], weight.shape[1])
         extra_bias = weight @ extra_bias
         weight.mul_(extra_weight.view(1, weight.size(1)).expand_as(weight))
@@ -65,13 +53,7 @@ def merge_pre_bn(module, pre_bn_1, pre_bn_2=None):
     module.bias.data = bias
 
 class ConvBNReLU(nn.Module):
-    def __init__(
-            self,
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride,
-            groups=1):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, groups=1):
         super(ConvBNReLU, self).__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride,
                               padding=1, groups=groups, bias=False)
@@ -79,27 +61,18 @@ class ConvBNReLU(nn.Module):
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        x = self.conv(x)
-        x = self.norm(x)
-        x = self.act(x)
-        return x
-
+        return self.act(self.norm(self.conv(x)))
 
 def _make_divisible(v, divisor, min_value=None):
     if min_value is None:
         min_value = divisor
     new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
-    # Make sure that round down does not go down by more than 10%.
     if new_v < 0.9 * v:
         new_v += divisor
     return new_v
 
-
 class PatchEmbed(nn.Module):
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 stride=1):
+    def __init__(self, in_channels, out_channels, stride=1):
         super(PatchEmbed, self).__init__()
         norm_layer = partial(nn.BatchNorm2d, eps=NORM_EPS)
         if stride == 2:
@@ -118,7 +91,6 @@ class PatchEmbed(nn.Module):
     def forward(self, x):
         return self.norm(self.conv(self.avgpool(x)))
 
-
 class h_sigmoid(nn.Module):
     def __init__(self, inplace=True):
         super(h_sigmoid, self).__init__()
@@ -126,7 +98,6 @@ class h_sigmoid(nn.Module):
 
     def forward(self, x):
         return self.relu(x + 3) / 6
-
 
 class h_swish(nn.Module):
     def __init__(self, inplace=True):
@@ -153,7 +124,6 @@ class CoordAtt(nn.Module):
 
     def forward(self, x):
         identity = x
-        
         n,c,h,w = x.size()
         x_h = self.pool_h(x)
         x_w = self.pool_w(x).permute(0, 1, 3, 2)
@@ -173,9 +143,7 @@ class CoordAtt(nn.Module):
         return out
 
 class MHCA(nn.Module):
-    """
-    Multi-Head Convolutional Attention (Enhanced with Coordinate Attention)
-    """
+    """ Multi-Head Convolutional Attention """
     def __init__(self, out_channels, head_dim, use_coord=False):
         super(MHCA, self).__init__()
         norm_layer = partial(nn.BatchNorm2d, eps=NORM_EPS)
@@ -197,27 +165,6 @@ class MHCA(nn.Module):
         out = self.projection(out)
         return out
 
-class ECALayer(nn.Module):
-    def __init__(self, channel, gamma=2, b=1, sigmoid=True):
-        super(ECALayer, self).__init__()
-        t = int(abs((math.log(channel, 2) + b) / gamma))
-        k = t if t % 2 else t + 1
-
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.conv = nn.Conv1d(1, 1, kernel_size=k, padding=k // 2, bias=False)
-        if sigmoid:
-            self.sigmoid = nn.Sigmoid()
-        else:
-            self.sigmoid = h_sigmoid()
-
-    def forward(self, x):
-        y = self.avg_pool(x)
-        y = self.conv(y.squeeze(-1).transpose(-1, -2))
-        y = y.transpose(-1, -2).unsqueeze(-1)
-        y = self.sigmoid(y)
-        return x * y.expand_as(x)
-
-
 class SELayer(nn.Module):
     def __init__(self, channel, reduction=4):
         super(SELayer, self).__init__()
@@ -235,67 +182,33 @@ class SELayer(nn.Module):
         y = self.fc(y).view(b, c, 1, 1)
         return x * y
 
-class LocalityFeedForward(nn.Module):
-    def __init__(self, in_dim=64, out_dim=96, kernel_size=3, stride=1, expand_ratio=4., act='hs+se', reduction=4,
-                 wo_dp_conv=False, dp_first=False):
-        """
-        :param in_dim: the input dimension
-        :param out_dim: the output dimension. The input and output dimension should be the same.
-        :param stride: stride of the depth-wise convolution.
-        :param expand_ratio: expansion ratio of the hidden dimension.
-        :param act: the activation function.
-                    relu: ReLU
-                    hs: h_swish
-                    hs+se: h_swish and SE module
-                    hs+eca: h_swish and ECA module
-                    hs+ecah: h_swish and ECA module. Compared with eca, h_sigmoid is used.
-        :param reduction: reduction rate in SE module.
-        :param wo_dp_conv: without depth-wise convolution.
-        :param dp_first: place depth-wise convolution as the first layer.
-        """
-        super(LocalityFeedForward, self).__init__()
+class LocalityFeedForwardV3(nn.Module):
+    def __init__(self, in_dim, out_dim, kernel_size=3, stride=1, expand_ratio=4., act='hs+se', reduction=4):
+        super(LocalityFeedForwardV3, self).__init__()
         hidden_dim = int(in_dim * expand_ratio)
-
-
         layers = []
-        # the first linear layer is replaced by 1x1 convolution.
         layers.extend([
             nn.Conv2d(in_dim, hidden_dim, 1, 1, 0, bias=False),
             nn.BatchNorm2d(hidden_dim),
             h_swish() if act.find('hs') >= 0 else nn.ReLU6(inplace=True)])
 
-        # the depth-wise convolution between the two linear layers
-        if not wo_dp_conv:
-            dp = [
-                nn.Conv2d(hidden_dim, hidden_dim, kernel_size= kernel_size, stride= stride, padding= kernel_size // 2, groups=hidden_dim, bias=False),
-                nn.BatchNorm2d(hidden_dim),
-                h_swish() if act.find('hs') >= 0 else nn.ReLU6(inplace=True)
-            ]
-            if dp_first:
-                layers = dp + layers
-            else:
-                layers.extend(dp)
+        layers.extend([
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=kernel_size, stride=stride, padding=kernel_size // 2, groups=hidden_dim, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            h_swish() if act.find('hs') >= 0 else nn.ReLU6(inplace=True)
+        ])
 
-        if act.find('+') >= 0:
-            attn = act.split('+')[1]
-            if attn == 'se':
-                layers.append(SELayer(hidden_dim, reduction=reduction))
-            elif attn.find('eca') >= 0:
-                layers.append(ECALayer(hidden_dim, sigmoid=attn == 'eca'))
-            else:
-                raise NotImplementedError('Activation type {} is not implemented'.format(act))
+        if act.find('+se') >= 0:
+            layers.append(SELayer(hidden_dim, reduction=reduction))
 
-        # the second linear layer is replaced by 1x1 convolution.
         layers.extend([
             nn.Conv2d(hidden_dim, out_dim, 1, 1, 0, bias=False),
             nn.BatchNorm2d(out_dim)
         ])
-        self.conv = nn.Sequential(*layers)
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x):
-        x = x + self.conv(x)
-        return x
-
+        return self.net(x)
 
 class Mlp(nn.Module):
     def __init__(self, in_features, out_features=None, mlp_ratio=None, drop=0., bias=True):
@@ -318,28 +231,21 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
-
-class LFP(nn.Module):
-    """
-    Efficient Convolution Block
-    """
+class LFPv3(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, path_dropout=0.2,
                  drop=0, head_dim=32, mlp_ratio=3):
-        super(LFP, self).__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
+        super(LFPv3, self).__init__()
         norm_layer = partial(nn.BatchNorm2d, eps=NORM_EPS)
-        assert out_channels % head_dim == 0
-
+        
         self.patch_embed = PatchEmbed(in_channels, out_channels, stride)
-        #self.mhca = MHCA(out_channels, head_dim)
         self.norm1 = norm_layer(out_channels)
+        
         extra_args = {"rel_pos_bias": True} if is_natten_post_017 else {"bias": True}
         self.attn = NeighborhoodAttention(
             out_channels,
             kernel_size=7,
             dilation=None,
-            num_heads= (out_channels // head_dim),
+            num_heads=(out_channels // head_dim),
             qkv_bias=True,
             qk_scale=None,
             attn_drop=drop,
@@ -347,43 +253,32 @@ class LFP(nn.Module):
             **extra_args,
         )
         self.attention_path_dropout = DropPath(path_dropout)
-
-        self.conv = LocalityFeedForward(out_channels, out_channels, kernel_size, 1, mlp_ratio, reduction=out_channels)
-
+        
         self.norm2 = norm_layer(out_channels)
-        #self.mlp = Mlp(out_channels, mlp_ratio=mlp_ratio, drop=drop, bias=True)
-        #self.mlp_path_dropout = DropPath(path_dropout)
-        #hidden_dim = int(out_channels * mlp_ratio)
-        #self.kan = KAN([out_channels, hidden_dim, out_channels])
+        self.ffn = LocalityFeedForwardV3(out_channels, out_channels, kernel_size, 1, mlp_ratio, reduction=out_channels)
         self.is_bn_merged = False
 
     def merge_bn(self):
-        if not self.is_bn_merged:
-            self.mlp.merge_bn(self.norm)
-            self.is_bn_merged = True
+        pass
 
     def forward(self, x):
         x = self.patch_embed(x)
         b, c, h, w = x.shape
         shortcut = x
+        
         x = self.norm1(x)
         x = self.attn(x.reshape(b, h, w, c))
         x = shortcut + self.attention_path_dropout(x.reshape(b, c, h, w))
+        
         if not torch.onnx.is_in_onnx_export() and not self.is_bn_merged:
             out = self.norm2(x)
         else:
             out = x
-        #x = x + self.mlp_path_dropout(self.mlp(out))
-        x = x + self.conv(out) # (B, dim, 14, 14)
-        #b, d, t, _ = out.shape
-        #x = x + self.mlp_path_dropout(self.kan(out.reshape(-1, out.shape[1])).reshape(b, d, t, t))
+        x = x + self.ffn(out)
         return x
 
-
 class E_MHSA(nn.Module):
-    """
-    Efficient Multi-Head Self Attention
-    """
+    """ Efficient Multi-Head Self Attention """
     def __init__(self, dim, out_dim=None, head_dim=32, qkv_bias=True, qk_scale=None,
                  attn_drop=0, proj_drop=0., sr_ratio=1):
         super().__init__()
@@ -445,141 +340,137 @@ class E_MHSA(nn.Module):
         x = self.proj_drop(x)
         return x
 
-
-class GFP(nn.Module):
+class GFPv3(nn.Module):
     """
-    Local Transformer Block
+    Parallel Global-Local Transformer Block with WavKAN support
     """
     def __init__(
             self, in_channels, out_channels, path_dropout, stride=1, sr_ratio=1,
             mlp_ratio=2, head_dim=32, mix_block_ratio=0.75, attn_drop=0, drop=0,
-            use_kmp_glu=False, use_coord=False,
+            use_kmp_glu=False, use_coord=False, use_wavkan=False,
     ):
-        super(GFP, self).__init__()
+        super(GFPv3, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.mix_block_ratio = mix_block_ratio
         self.use_kmp_glu = use_kmp_glu
-        self.use_coord = use_coord
         norm_func = partial(nn.BatchNorm2d, eps=NORM_EPS)
 
+        # Calculate split channels
         self.mhsa_out_channels = _make_divisible(int(out_channels * mix_block_ratio), 32)
         self.mhca_out_channels = out_channels - self.mhsa_out_channels
 
-        self.patch_embed = PatchEmbed(in_channels, self.mhsa_out_channels, stride)
-        self.norm1 = norm_func(self.mhsa_out_channels)
+        # Input projection
+        self.patch_embed = PatchEmbed(in_channels, out_channels, stride)
+        
+        # Global Branch (MHSA)
+        self.norm_global = norm_func(self.mhsa_out_channels)
         self.e_mhsa = E_MHSA(self.mhsa_out_channels, head_dim=head_dim, sr_ratio=sr_ratio,
                              attn_drop=attn_drop, proj_drop=drop)
         self.mhsa_path_dropout = DropPath(path_dropout * mix_block_ratio)
 
-        self.projection = PatchEmbed(self.mhsa_out_channels, self.mhca_out_channels, stride=1)
+        # Local Branch (MHCA)
         self.mhca = MHCA(self.mhca_out_channels, head_dim=head_dim, use_coord=use_coord)
         self.mhca_path_dropout = DropPath(path_dropout * (1 - mix_block_ratio))
 
+        # FFN Section
         self.norm2 = norm_func(out_channels)
-        self.conv = LocalityFeedForward(out_channels, out_channels, stride=1, expand_ratio=mlp_ratio, reduction=out_channels)
-
-        #self.mlp = Mlp(out_channels, mlp_ratio=mlp_ratio, drop=drop)
         self.mlp_path_dropout = DropPath(path_dropout)
+        
         hidden_dim = int(out_channels * mlp_ratio)
-        self.kan = KAN([out_channels, hidden_dim, out_channels])
+        
+        if use_wavkan and WavKAN is not None:
+            self.kan = WavKAN([out_channels, hidden_dim, out_channels])
+        else:
+            self.kan = FasterKAN([out_channels, hidden_dim, out_channels])
+        
         if self.use_kmp_glu:
             self.mlp = Mlp(out_channels, mlp_ratio=mlp_ratio, drop=drop)
             self.kan_scale = nn.Parameter(torch.zeros(out_channels, 1, 1), requires_grad=True)
         else:
             self.mlp = None
-            self.gate = None
 
         self.is_bn_merged = False
-        self.reset_stats()
 
     def merge_bn(self):
         if not self.is_bn_merged:
-            self.e_mhsa.merge_bn(self.norm1)
+            self.e_mhsa.merge_bn(self.norm_global)
             if self.use_kmp_glu and self.mlp is not None:
                 self.mlp.merge_bn(self.norm2)
             self.is_bn_merged = True
 
-    def reset_stats(self):
-        self._alpha_sum = 0.0
-        self._gap_sum = 0.0
-        self._var_sum = 0.0
-        self._stat_steps = 0
-
-    def _update_stats(self, alpha_mean, gap_mean, var_mean):
-        self._alpha_sum += float(alpha_mean)
-        self._gap_sum += float(gap_mean)
-        self._var_sum += float(var_mean)
-        self._stat_steps += 1
-
-    def get_stats(self):
-        if self._stat_steps == 0:
-            return None
-        return {
-            "alpha_mean": self._alpha_sum / self._stat_steps,
-            "gap_mean": self._gap_sum / self._stat_steps,
-            "var_mean": self._var_sum / self._stat_steps,
-            "count": self._stat_steps,
-        }
-
     def forward(self, x):
+        # 1. Patch Embedding & Stride
         x = self.patch_embed(x)
         B, C, H, W = x.shape
+        
+        # 2. Split into Global and Local branches
+        x_global, x_local = torch.split(x, [self.mhsa_out_channels, self.mhca_out_channels], dim=1)
+        
+        # 3. Global Branch Processing
         if not torch.onnx.is_in_onnx_export() and not self.is_bn_merged:
-            out = self.norm1(x)
+            out_global = self.norm_global(x_global)
         else:
-            out = x
-        out = rearrange(out, "b c h w -> b (h w) c")  # b n c
-        out = self.mhsa_path_dropout(self.e_mhsa(out))
-        x = x + rearrange(out, "b (h w) c -> b c h w", h=H)
+            out_global = x_global
+        out_global = rearrange(out_global, "b c h w -> b (h w) c")
+        out_global = self.e_mhsa(out_global)
+        out_global = rearrange(out_global, "b (h w) c -> b c h w", h=H)
+        x_global = x_global + self.mhsa_path_dropout(out_global)
+        
+        # 4. Local Branch Processing
+        out_local = self.mhca(x_local)
+        x_local = x_local + self.mhca_path_dropout(out_local)
+        
+        # 5. Concatenate
+        x = torch.cat([x_global, x_local], dim=1)
 
-        out = self.projection(x)
-        out = out + self.mhca_path_dropout(self.mhca(out))
-        x = torch.cat([x, out], dim=1)
-
+        # 6. FFN (KAN / MLP)
         if not torch.onnx.is_in_onnx_export() and not self.is_bn_merged:
             out = self.norm2(x)
         else:
             out = x
-        #x = x + self.conv(out)
-        #x = x + self.mlp_path_dropout(self.mlp(out))
+            
         if self.use_kmp_glu:
             b, d, h, w = out.shape
+            # KAN processing
             kan_out = self.kan(out.permute(0, 2, 3, 1).reshape(-1, d))
             kan_out = kan_out.view(b, h, w, d).permute(0, 3, 1, 2)
+            
+            # MLP processing
             mlp_out = self.mlp(out)
             
-            # LayerScale: Initialize with 0 contribution from KAN
+            # Fusion
             fused = mlp_out + self.kan_scale * kan_out
             x = x + self.mlp_path_dropout(fused)
         else:
             b, d, t, _ = out.shape
+            # Pure KAN FFN
             x = x + self.mlp_path_dropout(self.kan(out.reshape(-1, out.shape[1])).reshape(b, d, t, t))
+            
         return x
 
-
-class MedViT(nn.Module):
+class MedViTv3(nn.Module):
     def __init__(self, stem_chs=[64, 32, 64], depths=[2, 2, 6, 2],
                  dims=[64, 128, 320, 512], path_dropout=0.1, attn_drop=0,
                  drop=0, num_classes=1000,
                  strides=[1, 2, 2, 2], sr_ratios=[8, 4, 2, 1], head_dim=32, mix_block_ratio=0.75,
-                 use_checkpoint=False, use_kmp_glu=False, use_coord=False, use_wavkan=False, **kwargs):
-        super(MedViT, self).__init__()
+                 use_checkpoint=False, use_kmp_glu=False, use_coord=False, use_wavkan=False):
+        super(MedViTv3, self).__init__()
         self.use_checkpoint = use_checkpoint
         self.use_kmp_glu = use_kmp_glu
         self.use_coord = use_coord
-        self.gfp_layers = []
+        self.use_wavkan = use_wavkan
 
         self.stage_out_channels = [[dims[0]] * (depths[0]),
                                    [dims[1]] * (depths[1] - 1) + [dims[1]],
                                    [dims[2], dims[2], dims[2]] * (depths[2] // 3),
                                    [dims[3]] * (depths[3])]
 
-        # Next Hybrid Strategy
-        self.stage_block_types = [[LFP] * depths[0],
-                                  [LFP] * (depths[1] - 1) + [GFP],
-                                  [LFP, LFP, GFP] * (depths[2] // 3),
-                                  [GFP] * (depths[3])]
+        # Use LFPv3 and GFPv3
+        self.stage_block_types = [[LFPv3] * depths[0],
+                                  [LFPv3] * (depths[1] - 1) + [GFPv3],
+                                  [LFPv3, LFPv3, GFPv3] * (depths[2] // 3),
+                                  [GFPv3] * (depths[3])]
 
         self.stem = nn.Sequential(
             ConvBNReLU(3, stem_chs[0], kernel_size=3, stride=2),
@@ -590,9 +481,10 @@ class MedViT(nn.Module):
         input_channel = stem_chs[-1]
         features = []
         idx = 0
-        dpr = [x.item() for x in torch.linspace(0, path_dropout, sum(depths))]  # stochastic depth decay rule
+        dpr = [x.item() for x in torch.linspace(0, path_dropout, sum(depths))]
+        
         for stage_id in range(len(depths)):
-            kernel=7 if stage_id == 0 else 3
+            kernel = 7 if stage_id == 0 else 3
             numrepeat = depths[stage_id]
             output_channels = self.stage_out_channels[stage_id]
             block_types = self.stage_block_types[stage_id]
@@ -603,65 +495,34 @@ class MedViT(nn.Module):
                     stride = 1
                 output_channel = output_channels[block_id]
                 block_type = block_types[block_id]
-                if block_type is LFP:
-                    layer = LFP(input_channel, output_channel, stride=stride, kernel_size=kernel, path_dropout=dpr[idx + block_id],
+                
+                if block_type is LFPv3:
+                    layer = LFPv3(input_channel, output_channel, stride=stride, kernel_size=kernel, path_dropout=dpr[idx + block_id],
                                 drop=drop, head_dim=head_dim)
                     features.append(layer)
-                elif block_type is GFP:
-                    layer = GFP(input_channel, output_channel, path_dropout=dpr[idx + block_id], stride=stride,
+                elif block_type is GFPv3:
+                    layer = GFPv3(input_channel, output_channel, path_dropout=dpr[idx + block_id], stride=stride,
                                 sr_ratio=sr_ratios[stage_id], head_dim=head_dim, mix_block_ratio=mix_block_ratio,
-                                attn_drop=attn_drop, drop=drop, use_kmp_glu=self.use_kmp_glu, use_coord=self.use_coord)
+                                attn_drop=attn_drop, drop=drop, use_kmp_glu=self.use_kmp_glu, use_coord=self.use_coord,
+                                use_wavkan=self.use_wavkan)
                     features.append(layer)
-                    self.gfp_layers.append(layer)
                 input_channel = output_channel
             idx += numrepeat
         self.features = nn.Sequential(*features)
 
         self.norm = nn.BatchNorm2d(output_channel, eps=NORM_EPS)
-
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.proj_head = nn.Sequential(
             nn.Linear(output_channel, num_classes),
         )
 
-        self.stage_out_idx = [sum(depths[:idx + 1]) - 1 for idx in range(len(depths))]
-        print('initialize_weights...')
         self._initialize_weights()
 
     def merge_bn(self):
         self.eval()
         for idx, module in self.named_modules():
-            if isinstance(module, LFP) or isinstance(module, GFP):
+            if isinstance(module, LFPv3) or isinstance(module, GFPv3):
                 module.merge_bn()
-
-    def reset_stat_logs(self):
-        for layer in getattr(self, "gfp_layers", []):
-            if hasattr(layer, "reset_stats"):
-                layer.reset_stats()
-
-    def collect_stat_logs(self):
-        stats = []
-        for idx, layer in enumerate(getattr(self, "gfp_layers", [])):
-            layer_stats = layer.get_stats()
-            if layer_stats is not None:
-                layer_stats = dict(layer_stats)
-                layer_stats["layer_index"] = idx
-                stats.append(layer_stats)
-        if not stats:
-            return None
-        total_count = sum(s["count"] for s in stats)
-        if total_count == 0:
-            return None
-        alpha_mean = sum(s["alpha_mean"] * s["count"] for s in stats) / total_count
-        gap_mean = sum(s["gap_mean"] * s["count"] for s in stats) / total_count
-        var_mean = sum(s["var_mean"] * s["count"] for s in stats) / total_count
-        return {
-            "alpha_mean": alpha_mean,
-            "gap_mean": gap_mean,
-            "var_mean": var_mean,
-            "count": total_count,
-            "per_layer": stats,
-        }
 
     def _initialize_weights(self):
         for n, m in self.named_modules():
@@ -693,35 +554,21 @@ class MedViT(nn.Module):
         return x
 
 @register_model
-def MedViT_tiny(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay= None, **kwargs):
-    model = MedViT(stem_chs=[64, 32, 64],
-                   depths=[2, 2, 6, 1],
-                   dims=[64, 128, 192, 384],
-                   path_dropout=0.1, **kwargs)
+def MedViTv3_tiny(pretrained=False, **kwargs):
+    model = MedViTv3(stem_chs=[64, 32, 64], depths=[2, 2, 6, 1], dims=[64, 128, 192, 384], path_dropout=0.1, **kwargs)
     return model
 
 @register_model
-def MedViT_small(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay= None, **kwargs):
-    model = MedViT(stem_chs=[64, 32, 64],
-                   depths=[2, 2, 6, 2],
-                   dims=[64, 128, 256, 512],
-                   path_dropout=0.1, **kwargs)
+def MedViTv3_small(pretrained=False, **kwargs):
+    model = MedViTv3(stem_chs=[64, 32, 64], depths=[2, 2, 6, 2], dims=[64, 128, 256, 512], path_dropout=0.1, **kwargs)
     return model
 
-
 @register_model
-def MedViT_base(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay= None, **kwargs):
-    model = MedViT(stem_chs=[64, 32, 64],
-                   depths=[2, 2, 6, 2],
-                   dims=[96, 192, 384, 768],
-                   path_dropout=0.2, **kwargs)
+def MedViTv3_base(pretrained=False, **kwargs):
+    model = MedViTv3(stem_chs=[64, 32, 64], depths=[2, 2, 6, 2], dims=[96, 192, 384, 768], path_dropout=0.2, **kwargs)
     return model
 
-
 @register_model
-def MedViT_large(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay= None, **kwargs):
-    model = MedViT(stem_chs=[64, 32, 64],
-                   depths=[2, 2, 6, 2],
-                   dims=[96, 256, 512, 1024],
-                   path_dropout=0.2, **kwargs)
+def MedViTv3_large(pretrained=False, **kwargs):
+    model = MedViTv3(stem_chs=[64, 32, 64], depths=[2, 2, 6, 2], dims=[96, 256, 512, 1024], path_dropout=0.2, **kwargs)
     return model
