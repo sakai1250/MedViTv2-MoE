@@ -347,13 +347,17 @@ class GFPv3(nn.Module):
     def __init__(
             self, in_channels, out_channels, path_dropout, stride=1, sr_ratio=1,
             mlp_ratio=2, head_dim=32, mix_block_ratio=0.75, attn_drop=0, drop=0,
-            use_kmp_glu=False, use_coord=False, use_wavkan=False,
+            use_kmp_glu=False, use_coord=False, use_wavkan=False, 
+            use_kan=True, enable_global=True, enable_local=True,
     ):
         super(GFPv3, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.mix_block_ratio = mix_block_ratio
         self.use_kmp_glu = use_kmp_glu
+        self.use_kan = use_kan
+        self.enable_global = enable_global
+        self.enable_local = enable_local
         norm_func = partial(nn.BatchNorm2d, eps=NORM_EPS)
 
         # Calculate split channels
@@ -379,10 +383,13 @@ class GFPv3(nn.Module):
         
         hidden_dim = int(out_channels * mlp_ratio)
         
-        if use_wavkan and WavKAN is not None:
-            self.kan = WavKAN([out_channels, hidden_dim, out_channels])
+        if self.use_kan:
+            if use_wavkan and WavKAN is not None:
+                self.kan = WavKAN([out_channels, hidden_dim, out_channels])
+            else:
+                self.kan = FasterKAN([out_channels, hidden_dim, out_channels])
         else:
-            self.kan = FasterKAN([out_channels, hidden_dim, out_channels])
+            self.kan = Mlp(out_channels, mlp_ratio=mlp_ratio, drop=drop)
         
         if self.use_kmp_glu:
             self.mlp = Mlp(out_channels, mlp_ratio=mlp_ratio, drop=drop)
@@ -408,18 +415,20 @@ class GFPv3(nn.Module):
         x_global, x_local = torch.split(x, [self.mhsa_out_channels, self.mhca_out_channels], dim=1)
         
         # 3. Global Branch Processing
-        if not torch.onnx.is_in_onnx_export() and not self.is_bn_merged:
-            out_global = self.norm_global(x_global)
-        else:
-            out_global = x_global
-        out_global = rearrange(out_global, "b c h w -> b (h w) c")
-        out_global = self.e_mhsa(out_global)
-        out_global = rearrange(out_global, "b (h w) c -> b c h w", h=H)
-        x_global = x_global + self.mhsa_path_dropout(out_global)
+        if self.enable_global:
+            if not torch.onnx.is_in_onnx_export() and not self.is_bn_merged:
+                out_global = self.norm_global(x_global)
+            else:
+                out_global = x_global
+            out_global = rearrange(out_global, "b c h w -> b (h w) c")
+            out_global = self.e_mhsa(out_global)
+            out_global = rearrange(out_global, "b (h w) c -> b c h w", h=H)
+            x_global = x_global + self.mhsa_path_dropout(out_global)
         
         # 4. Local Branch Processing
-        out_local = self.mhca(x_local)
-        x_local = x_local + self.mhca_path_dropout(out_local)
+        if self.enable_local:
+            out_local = self.mhca(x_local)
+            x_local = x_local + self.mhca_path_dropout(out_local)
         
         # 5. Concatenate
         x = torch.cat([x_global, x_local], dim=1)
@@ -433,8 +442,11 @@ class GFPv3(nn.Module):
         if self.use_kmp_glu:
             b, d, h, w = out.shape
             # KAN processing
-            kan_out = self.kan(out.permute(0, 2, 3, 1).reshape(-1, d))
-            kan_out = kan_out.view(b, h, w, d).permute(0, 3, 1, 2)
+            if self.use_kan:
+                kan_out = self.kan(out.permute(0, 2, 3, 1).reshape(-1, d))
+                kan_out = kan_out.view(b, h, w, d).permute(0, 3, 1, 2)
+            else:
+                kan_out = self.kan(out)
             
             # MLP processing
             mlp_out = self.mlp(out)
@@ -445,7 +457,10 @@ class GFPv3(nn.Module):
         else:
             b, d, t, _ = out.shape
             # Pure KAN FFN
-            x = x + self.mlp_path_dropout(self.kan(out.reshape(-1, out.shape[1])).reshape(b, d, t, t))
+            if self.use_kan:
+                x = x + self.mlp_path_dropout(self.kan(out.reshape(-1, out.shape[1])).reshape(b, d, t, t))
+            else:
+                x = x + self.mlp_path_dropout(self.kan(out))
             
         return x
 
@@ -454,7 +469,8 @@ class MedViTv3(nn.Module):
                  dims=[64, 128, 320, 512], path_dropout=0.1, attn_drop=0,
                  drop=0, num_classes=1000,
                  strides=[1, 2, 2, 2], sr_ratios=[8, 4, 2, 1], head_dim=32, mix_block_ratio=0.75,
-                 use_checkpoint=False, use_kmp_glu=False, use_coord=False, use_wavkan=False):
+                 use_checkpoint=False, use_kmp_glu=False, use_coord=False, use_wavkan=False,
+                 use_kan=True, enable_global=True, enable_local=True, **kwargs):
         super(MedViTv3, self).__init__()
         self.use_checkpoint = use_checkpoint
         self.use_kmp_glu = use_kmp_glu
@@ -504,7 +520,7 @@ class MedViTv3(nn.Module):
                     layer = GFPv3(input_channel, output_channel, path_dropout=dpr[idx + block_id], stride=stride,
                                 sr_ratio=sr_ratios[stage_id], head_dim=head_dim, mix_block_ratio=mix_block_ratio,
                                 attn_drop=attn_drop, drop=drop, use_kmp_glu=self.use_kmp_glu, use_coord=self.use_coord,
-                                use_wavkan=self.use_wavkan)
+                                use_wavkan=self.use_wavkan, use_kan=use_kan, enable_global=enable_global, enable_local=enable_local)
                     features.append(layer)
                 input_channel = output_channel
             idx += numrepeat

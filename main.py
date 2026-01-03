@@ -435,7 +435,10 @@ def main(args):
     # Select model
     if model_name in model_classes:
         model_class = model_classes[model_name]
-        net = model_class(num_classes=nb_classes, use_kmp_glu=args.use_kmp_glu, use_coord=args.use_coord, use_wavkan=args.use_wavkan).cuda()
+        net = model_class(num_classes=nb_classes, use_kmp_glu=args.use_kmp_glu, 
+                          use_coord=args.use_coord, use_wavkan=args.use_wavkan,
+                          use_kan=args.use_kan, enable_global=args.enable_global,
+                          enable_local=args.enable_local).cuda()
         if pretrained:
             checkpoint_path = args.checkpoint_path
             if not os.path.exists(checkpoint_path):
@@ -494,6 +497,9 @@ if __name__ == '__main__':
     parser.add_argument('--use_kmp_glu', type=lambda x: bool(strtobool(x)), default=False, help='Enable KAN-MLP parallel GLU fusion in GFP blocks (default: False).')
     parser.add_argument('--use_coord', type=lambda x: bool(strtobool(x)), default=False, help='Enable Coordinate Attention in MHCA (default: False).')
     parser.add_argument('--use_wavkan', type=lambda x: bool(strtobool(x)), default=False, help='Use WavKAN instead of FasterKAN (default: False).')
+    parser.add_argument('--use_kan', type=lambda x: bool(strtobool(x)), default=True, help='Use KAN in FFN (default: True). If False, uses MLP.')
+    parser.add_argument('--enable_global', type=lambda x: bool(strtobool(x)), default=True, help='Enable Global Branch in GFP (default: True).')
+    parser.add_argument('--enable_local', type=lambda x: bool(strtobool(x)), default=True, help='Enable Local Branch in GFP (default: True).')
 
     args = parser.parse_args()
     main(args)
