@@ -1,6 +1,6 @@
 """
 MedViTv3: Improved MedViT with Parallel Global/Local Branches and Cleaned Architecture.
-Supports WavKAN integration.
+Supports WavKAN integration and KAN-Gated MLP fusion.
 """
 from functools import partial
 import math
@@ -17,6 +17,11 @@ try:
     from wavkan import WavKAN
 except ImportError:
     WavKAN = None
+
+try:
+    from ac_kan import ACKAN
+except ImportError:
+    ACKAN = None
 
 is_natten_post_017 = hasattr(natten, "context")
 
@@ -347,7 +352,7 @@ class GFPv3(nn.Module):
     def __init__(
             self, in_channels, out_channels, path_dropout, stride=1, sr_ratio=1,
             mlp_ratio=2, head_dim=32, mix_block_ratio=0.75, attn_drop=0, drop=0,
-            use_kmp_glu=False, use_coord=False, use_wavkan=False, 
+            use_kmp_glu=False, use_coord=False, use_wavkan=False, use_ackan=False,
             use_kan=True, enable_global=True, enable_local=True,
     ):
         super(GFPv3, self).__init__()
@@ -356,6 +361,7 @@ class GFPv3(nn.Module):
         self.mix_block_ratio = mix_block_ratio
         self.use_kmp_glu = use_kmp_glu
         self.use_kan = use_kan
+        self.use_ackan = use_ackan
         self.enable_global = enable_global
         self.enable_local = enable_local
         norm_func = partial(nn.BatchNorm2d, eps=NORM_EPS)
@@ -384,7 +390,9 @@ class GFPv3(nn.Module):
         hidden_dim = int(out_channels * mlp_ratio)
         
         if self.use_kan:
-            if use_wavkan and WavKAN is not None:
+            if use_ackan and ACKAN is not None:
+                self.kan = ACKAN(out_channels)
+            elif use_wavkan and WavKAN is not None:
                 self.kan = WavKAN([out_channels, hidden_dim, out_channels])
             else:
                 self.kan = FasterKAN([out_channels, hidden_dim, out_channels])
@@ -443,8 +451,11 @@ class GFPv3(nn.Module):
             b, d, h, w = out.shape
             # KAN processing
             if self.use_kan:
-                kan_out = self.kan(out.permute(0, 2, 3, 1).reshape(-1, d))
-                kan_out = kan_out.view(b, h, w, d).permute(0, 3, 1, 2)
+                if self.use_ackan:
+                    kan_out = self.kan(out)
+                else:
+                    kan_out = self.kan(out.permute(0, 2, 3, 1).reshape(-1, d))
+                    kan_out = kan_out.view(b, h, w, d).permute(0, 3, 1, 2)
             else:
                 kan_out = self.kan(out)
             
@@ -452,13 +463,19 @@ class GFPv3(nn.Module):
             mlp_out = self.mlp(out)
             
             # Fusion
-            fused = mlp_out + self.kan_scale * kan_out
+            #fused = mlp_out + self.kan_scale * kan_out
+            # Novelty: KAN-Gated MLP (Modulation)
+            # Instead of simple addition, we use KAN to modulate the MLP features.
+            fused = mlp_out * (1 + self.kan_scale * torch.tanh(kan_out))
             x = x + self.mlp_path_dropout(fused)
         else:
             b, d, t, _ = out.shape
             # Pure KAN FFN
             if self.use_kan:
-                x = x + self.mlp_path_dropout(self.kan(out.reshape(-1, out.shape[1])).reshape(b, d, t, t))
+                if self.use_ackan:
+                    x = x + self.mlp_path_dropout(self.kan(out))
+                else:
+                    x = x + self.mlp_path_dropout(self.kan(out.reshape(-1, out.shape[1])).reshape(b, d, t, t))
             else:
                 x = x + self.mlp_path_dropout(self.kan(out))
             
@@ -469,13 +486,14 @@ class MedViTv3(nn.Module):
                  dims=[64, 128, 320, 512], path_dropout=0.1, attn_drop=0,
                  drop=0, num_classes=1000,
                  strides=[1, 2, 2, 2], sr_ratios=[8, 4, 2, 1], head_dim=32, mix_block_ratio=0.75,
-                 use_checkpoint=False, use_kmp_glu=False, use_coord=False, use_wavkan=False,
+                 use_checkpoint=False, use_kmp_glu=False, use_coord=False, use_wavkan=False, use_ackan=False,
                  use_kan=True, enable_global=True, enable_local=True, **kwargs):
         super(MedViTv3, self).__init__()
         self.use_checkpoint = use_checkpoint
         self.use_kmp_glu = use_kmp_glu
         self.use_coord = use_coord
         self.use_wavkan = use_wavkan
+        self.use_ackan = use_ackan
 
         self.stage_out_channels = [[dims[0]] * (depths[0]),
                                    [dims[1]] * (depths[1] - 1) + [dims[1]],
@@ -520,7 +538,7 @@ class MedViTv3(nn.Module):
                     layer = GFPv3(input_channel, output_channel, path_dropout=dpr[idx + block_id], stride=stride,
                                 sr_ratio=sr_ratios[stage_id], head_dim=head_dim, mix_block_ratio=mix_block_ratio,
                                 attn_drop=attn_drop, drop=drop, use_kmp_glu=self.use_kmp_glu, use_coord=self.use_coord,
-                                use_wavkan=self.use_wavkan, use_kan=use_kan, enable_global=enable_global, enable_local=enable_local)
+                                use_wavkan=self.use_wavkan, use_ackan=self.use_ackan, use_kan=use_kan, enable_global=enable_global, enable_local=enable_local)
                     features.append(layer)
                 input_channel = output_channel
             idx += numrepeat

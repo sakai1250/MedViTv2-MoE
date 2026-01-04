@@ -24,7 +24,6 @@ class WavKANLayer(nn.Module):
         
         # Base weight (linear residual)
         self.base_weight = nn.Linear(input_dim, output_dim)
-        self.bn = nn.BatchNorm1d(input_dim)
         
         self.reset_parameters()
 

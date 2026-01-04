@@ -17,6 +17,11 @@ from zipfile import ZipFile
 import pandas as pd
 import shutil
 
+try:
+    from imagecorruptions import corrupt
+except ImportError:
+    corrupt = None
+
 # Set the random seed for reproducibility
 seed = 42
 torch.manual_seed(seed)
@@ -428,6 +433,9 @@ def build_dataset(args):
 
 
 def build_transform(args):
+    corruption = getattr(args, 'corruption', 'clean')
+    severity = getattr(args, 'severity', 1)
+
     t_train = []
     # this should always dispatch to transforms_imagenet_train
     t_train.append(transforms.RandomResizedCrop(224))
@@ -440,6 +448,15 @@ def build_transform(args):
 
     t_test = []
     t_test.append(transforms.Resize((224, 224)))
+    
+    if corruption != 'clean':
+        if corrupt is None:
+            print("Warning: imagecorruptions not installed. Install it via `pip install imagecorruptions`. Proceeding without corruption.")
+        else:
+            t_test.append(transforms.Lambda(lambda x: np.array(x)))
+            t_test.append(transforms.Lambda(lambda x: corrupt(x, severity=severity, corruption_name=corruption)))
+            t_test.append(transforms.ToPILImage())
+
     #t_test.append(transforms.Lambda(lambda image: image.convert('RGB')))
     t_test.append(transforms.ToTensor())
     t_test.append(transforms.Normalize(mean=[.5], std=[.5]))
