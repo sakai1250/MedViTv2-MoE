@@ -12,3 +12,6 @@ checkpoints/
 *.png
 *.jpg
 *.jpeg
+docs/
+nazo/
+caluculated_features/

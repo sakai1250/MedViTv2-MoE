@@ -23,17 +23,17 @@
 # Datasets to process データセットサイズ順(昇順)
 datasets=(
     # "breastmnist"
-    # "retinamnist"
-    # "pneumoniamnist"
-    # "dermamnist"
-    "bloodmnist"
-    "organcmnist"
-    "organsmnist"
-    "organamnist"
-    "pathmnist"
-    "octmnist"
-    "chestmnist"
-    "tissuemnist"
+    "retinamnist"
+    "pneumoniamnist"
+    "dermamnist"
+    # "bloodmnist"
+    # "organcmnist"
+    # "organsmnist"
+    # "organamnist"
+    # "pathmnist"
+    # "octmnist"
+    # "chestmnist"
+    # "tissuemnist"
 )
 
 # Function to run ablation experiments
@@ -45,10 +45,11 @@ run_ablation() {
     echo "Running ablation for $dataset on GPU $gpu_id"
 
     # ACKAN
-   # echo "MedViTv3_tiny ACKAN" >> "$output_file"
+    # echo "MedViTv3_tiny ACKAN" >> "$output_file"
     # CUDA_VISIBLE_DEVICES=$gpu_id python main.py --model_name 'MedViTv3_tiny' --dataset "$dataset" --pretrained True --use_ackan True
     echo "MedViTv3_tiny ACKAN --enable_local False --enable_global False" >> "$output_file"
     CUDA_VISIBLE_DEVICES=$gpu_id python main.py --model_name 'MedViTv3_tiny' --dataset "$dataset" --pretrained True --use_ackan True --enable_local False --enable_global False
+
     # # Baseline (WavKAN)
     # echo "MedViTv3_tiny Baseline (WavKAN)" >> "$output_file"
     # CUDA_VISIBLE_DEVICES=$gpu_id python main.py --model_name 'MedViTv3_tiny' --dataset "$dataset" --pretrained True --use_ackan True
@@ -69,13 +70,13 @@ run_ablation() {
 # ==========================================
 # Execution on GPU 1
 # ==========================================
-for dataset in "${datasets[@]}"; do
-    run_ablation "$dataset" 1
-done
-
-# # ==========================================
-# # Execution on GPU 0
-# # ==========================================
 # for dataset in "${datasets[@]}"; do
-#     run_ablation "$dataset" 0
+#     run_ablation "$dataset" 1
 # done
+
+# ==========================================
+# Execution on GPU 0
+# ==========================================
+for dataset in "${datasets[@]}"; do
+    run_ablation "$dataset" 0
+done

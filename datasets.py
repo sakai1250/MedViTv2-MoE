@@ -10,6 +10,16 @@ from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.data import create_transform
 import medmnist
 from medmnist import INFO, Evaluator
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), 'medmnistc-api')))
+try:
+    from medmnistc.augmentation import AugMedMNISTC
+    from medmnistc.corruptions.registry import CORRUPTIONS_DS, CORRUPTIONS_DS_FOLDS
+except ImportError:
+    AugMedMNISTC = None
+    CORRUPTIONS_DS = {}
+    CORRUPTIONS_DS_FOLDS = {}
+    print("Warning: medmnistc not found. TS corruptions will not work.")
 
 
 import requests
@@ -401,7 +411,7 @@ def build_dataset(args):
         train_dataset = datasets.ImageFolder(root=train_path, transform=train_transform) 
         test_dataset = datasets.ImageFolder(root=test_path, transform=test_transform) 
         return train_dataset, test_dataset, nb_classes
-    elif args.dataset.endswith('mnist'):
+    elif args.dataset.lower().endswith('mnist'):
         info = INFO[args.dataset]
         task = info['task']
         n_channels = info['n_channels']
@@ -453,9 +463,44 @@ def build_transform(args):
         if corrupt is None:
             print("Warning: imagecorruptions not installed. Install it via `pip install imagecorruptions`. Proceeding without corruption.")
         else:
-            t_test.append(transforms.Lambda(lambda x: np.array(x)))
-            t_test.append(transforms.Lambda(lambda x: corrupt(x, severity=severity, corruption_name=corruption)))
-            t_test.append(transforms.ToPILImage())
+            # Check if corruption is in medmnistc registry (for TS etc)
+            # We need to map 'corruption' name to the actual corruption object
+            # CORRUPTIONS_DS is structured by dataset -> corruption_name -> object
+            # But here we don't know the dataset easily inside build_transform without passing it
+            # args.dataset is available!
+            
+            is_medmnistc = False
+            if AugMedMNISTC is not None and args.dataset in CORRUPTIONS_DS:
+                ds_corruptions = CORRUPTIONS_DS[args.dataset]
+                if corruption in ds_corruptions:
+                    # medmnistc corruption
+                    is_medmnistc = True
+                    # Create a temporary dict for AugMedMNISTC with just this corruption/severity
+                    # But AugMedMNISTC expects a dict of corruptions where each corruption has its own severity param list
+                    # And it picks one randomly? No, let's check AugMedMNISTC implementation
+                    # Actually, we can just use the corruption object directly if possible
+                    # Or construct a single-corruption dict
+                    
+                    # CORRUPTIONS_DS[dataset][corruption] is an instance of a Corruption class
+                    # It has a method likely to apply corruption
+                    # Let's assume we can use AugMedMNISTC with a specific config
+                    
+                    # Construct a subset dict
+                    # The severity in medmnistc is handled by the Corruption object which has 'severity_params'
+                    # But here we want a specific severity level (1-5)
+                    # We might need to manually call the corruption function
+                    
+                    # Let's retrieve the corruption object
+                    corr_obj = ds_corruptions[corruption]
+                    # corr_obj(image, severity) -> image
+                    # Let's check corruption obect signature in registry.py or base class
+                    # It likely inherits from something callable
+                    t_test.append(transforms.Lambda(lambda x: corr_obj.apply(x, severity=severity-1)))
+            
+            if not is_medmnistc:
+                t_test.append(transforms.Lambda(lambda x: np.array(x)))
+                t_test.append(transforms.Lambda(lambda x: corrupt(x, severity=severity, corruption_name=corruption)))
+                t_test.append(transforms.ToPILImage())
 
     #t_test.append(transforms.Lambda(lambda image: image.convert('RGB')))
     t_test.append(transforms.ToTensor())

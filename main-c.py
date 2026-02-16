@@ -31,7 +31,16 @@ from MedViT import MedViT_tiny, MedViT_small, MedViT_base, MedViT_large
 from MedViTv3 import MedViTv3_tiny, MedViTv3_small, MedViTv3_base, MedViTv3_large
 from datetime import datetime
 
-# MedMNIST-C Corruptions
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), 'medmnistc-api')))
+try:
+    from medmnistc.corruptions.registry import CORRUPTIONS_DS, CORRUPTIONS_DS_FOLDS
+    MEDMNISTC_AVAILABLE = True
+except ImportError:
+    MEDMNISTC_AVAILABLE = False
+    print("Warning: medmnistc not found. Using default corruptions.")
+
+# Fallback if medmnistc not available
 CORRUPTIONS = [
     'gaussian_noise', 'shot_noise', 'impulse_noise', 'defocus_blur',
     'glass_blur', 'motion_blur', 'zoom_blur', 'snow', 'frost', 'fog',
@@ -266,45 +275,135 @@ def main(args):
         print("Warning: No checkpoint found. Evaluating with current weights.")
 
     # Determine corruptions to evaluate
-    if args.corruption == 'all':
-        corruption_list = CORRUPTIONS
-        severity_list = [1, 2, 3, 4, 5]
-    elif args.corruption != 'clean':
-        corruption_list = [args.corruption]
-        severity_list = [args.severity]
-    else:
-        # Just clean evaluation
-        corruption_list = ['clean']
-        severity_list = [0]
-
     results = {}
     
-    for c in corruption_list:
-        for s in severity_list:
-            if c == 'clean' and s > 0: continue
+    # Run Clean Evaluation First (Always necessary for relative metrics)
+    print(f"Evaluating: Clean (s0)")
+    args.corruption = 'clean'
+    args.severity = 0
+    _, test_dataset, _ = build_dataset(args=args)
+    test_loader = data.DataLoader(dataset=test_dataset, batch_size=2*batch_size, shuffle=False)
+    
+    if dataset_name.endswith('mnist'):
+        metrics = evaluate_mnist(net, test_loader, device, dataset_name, task)
+        clean_auc, clean_acc = metrics
+        print(f"Result [Clean] -> AUC: {clean_auc:.4f}, ACC: {clean_acc:.4f}")
+        results['clean'] = {'auc': clean_auc, 'acc': clean_acc}
+    else:
+        print("Evaluation for non-MedMNIST datasets not fully implemented in this script.")
+        clean_acc = 0.0 # Placeholder
+    
+    
+    if args.corruption == 'all':
+        # Use MEDMNISTC grouping if available and dataset supported
+        if MEDMNISTC_AVAILABLE and dataset_name in CORRUPTIONS_DS:
+            eval_groups = CORRUPTIONS_DS_FOLDS
+            # Ensure we only use corruptions defined for this dataset
+            ds_corruptions = CORRUPTIONS_DS[dataset_name]
+        else:
+            # Fallback grouping
+            eval_groups = {'all': CORRUPTIONS}
+            ds_corruptions = set(CORRUPTIONS) # Treat as set of names
+    elif args.corruption != 'clean':
+        eval_groups = {'custom': [args.corruption]}
+        ds_corruptions = {args.corruption} # Placeholder
+    else:
+        eval_groups = {} # Just clean done
+    
+    # Initialize aggregated results
+    group_results = {} # group -> list of accs
+    
+    for group_name, corruption_list in eval_groups.items():
+        if group_name not in group_results:
+             group_results[group_name] = []
+             
+        for c in corruption_list:
+            # Check if corruption is valid for this dataset (if using medmnistc logic)
+            if MEDMNISTC_AVAILABLE and dataset_name in CORRUPTIONS_DS:
+                 if c not in ds_corruptions:
+                     continue
             
-            print(f"Evaluating: {c} (Severity {s})")
-            
-            # Update args for build_dataset
-            args.corruption = c
-            args.severity = s
-            
-            # Rebuild dataset with corruption
-            _, test_dataset, _ = build_dataset(args=args)
-            test_loader = data.DataLoader(dataset=test_dataset, batch_size=2*batch_size, shuffle=False)
-            
-            if dataset_name.endswith('mnist'):
-                metrics = evaluate_mnist(net, test_loader, device, dataset_name, task)
-                auc, acc = metrics
-                print(f"Result [{c}, s{s}] -> AUC: {auc:.4f}, ACC: {acc:.4f}")
+            for s in [1, 2, 3, 4, 5]:
+                print(f"Evaluating: {c} (Severity {s}) [Group: {group_name}]")
                 
-                key = f"{c}_{s}"
-                results[key] = {"auc": auc, "acc": acc}
-            else:
-                print("Evaluation for non-MedMNIST datasets not fully implemented in this script.")
+                # Update args for build_dataset
+                args.corruption = c
+                args.severity = s
+                
+                # Rebuild dataset with corruption
+                _, test_dataset, _ = build_dataset(args=args)
+                test_loader = data.DataLoader(dataset=test_dataset, batch_size=2*batch_size, shuffle=False)
+                
+                if dataset_name.endswith('mnist'):
+                    metrics = evaluate_mnist(net, test_loader, device, dataset_name, task)
+                    auc, acc = metrics
+                    print(f"Result [{c}, s{s}] -> AUC: {auc:.4f}, ACC: {acc:.4f}")
+                    
+                    key = f"{c}_{s}"
+                    # results[key] = {"auc": auc, "acc": acc}
+                    group_results[group_name].append(acc)
+                    
+                    # Store detailed results if needed
+                    if group_name not in results: results[group_name] = {}
+                    if c not in results[group_name]: results[group_name][c] = {}
+                    results[group_name][c][s] = acc
+                else:
+                    pass
 
     # Save results
     result_file = f'medmnist_c_results_{model_name}_{dataset_name}.json'
+    results['final_metrics'] = {}
+    
+    print("\n" + "="*80)
+    print(f"{'Metric':<20} | {'bACC':<10} | {'rBE':<10} | {'BE':<10}")
+    print("-" * 80)
+    
+    # Calculate metrics grouped by Digital, Noise, Blur, Color, TS
+    # And Overall
+    
+    # Helper to calc metrics
+    def calc_metrics(acc_list, clean_acc):
+        if not acc_list: return 0, 0, 0
+        bACC = np.mean(acc_list)
+        BE = 1.0 - bACC
+        clean_error = 1.0 - clean_acc
+        rBE = (BE / clean_error) if clean_error > 1e-6 else 0.0 # Relative Benchmark Error = Error_corr / Error_clean? Or (Error_corr - Error_clean)/Error_clean?
+        # Standard rCE in ImageNet-C is (Error_corr / Error_AlexNet). 
+        # User requested rBE ↓. If clean error is small, rBE is high. 
+        # Let's interpret rBE as Relative Benchmark Error = Error / CleanError. 
+        return bACC, rBE, BE
+        
+    # Calculate Overall
+    all_accs = []
+    for g, accs in group_results.items():
+        all_accs.extend(accs)
+        
+    overall_bACC, overall_rBE, overall_BE = calc_metrics(all_accs, clean_acc)
+    print(f"{'Overall':<20} | {overall_bACC:.4f}     | {overall_rBE:.4f}     | {overall_BE:.4f}")
+    results['final_metrics']['Overall'] = {'bACC': overall_bACC, 'rBE': overall_rBE, 'BE': overall_BE}
+    
+    # Calculate Per Group
+    # Requested Order: Digital Noise Blur Color TS
+    ordered_groups = ['digital', 'noise', 'blur', 'color', 'task-specific']
+    existing_groups = list(group_results.keys())
+    
+    # Process ordered groups if they exist
+    for g in ordered_groups:
+        if g in group_results:
+             bACC, rBE, BE = calc_metrics(group_results[g], clean_acc)
+             g_label = g.capitalize() if g != 'task-specific' else 'TS'
+             print(f"{g_label:<20} | {bACC:.4f}     | {rBE:.4f}     | {BE:.4f}")
+             results['final_metrics'][g] = {'bACC': bACC, 'rBE': rBE, 'BE': BE}
+             
+    # Process any other groups
+    for g in group_results:
+        if g not in ordered_groups and g != 'all':
+             bACC, rBE, BE = calc_metrics(group_results[g], clean_acc)
+             print(f"{g:<20} | {bACC:.4f}     | {rBE:.4f}     | {BE:.4f}")
+    
+    print("="*80)
+    print(f"bACCclean: {clean_acc:.4f}")
+    
     with open(result_file, 'w') as f:
         json.dump(results, f, indent=4)
     print(f"Results saved to {result_file}")

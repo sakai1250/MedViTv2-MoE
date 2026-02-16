@@ -70,7 +70,7 @@ class ComplexGaborConv2d(nn.Module):
 
         # Complex Carrier
         # Real part (Cosine)
-        real_part = weight * envelope * torch.cos(omega * x_rot + psi)
+        real_part = weight * envelope * torch.cos(omega * x_rot + psi) # 
         # Imaginary part (Sine)
         imag_part = weight * envelope * torch.sin(omega * x_rot + psi)
 
@@ -104,6 +104,7 @@ class ACKAN(nn.Module):
     """
     Adaptive Complex-Wavelet KAN (AC-KAN) Module.
     Integrates Channel-wise Basis Selection and Multi-Resolution analysis.
+    Optimized to use single grouped convolution instead of loop.
     """
     def __init__(self, channels, groups=4, kernel_size=3):
         super().__init__()
@@ -113,52 +114,52 @@ class ACKAN(nn.Module):
         assert channels % groups == 0, "Channels must be divisible by groups"
         self.group_channels = channels // groups
         
-        self.branches = nn.ModuleList()
+        # Optimized: Use a single layer with groups=channels (depthwise across all)
+        # This is mathematically equivalent to the loop if we initialize correctly.
+        self.layer = ComplexGaborConv2d(
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=kernel_size,
+            padding=kernel_size//2,
+            groups=channels # Depthwise across all channels
+        )
         
-        for i in range(groups):
-            # Use depthwise convolution within groups to mimic KAN's edge-wise activation
-            layer = ComplexGaborConv2d(
-                in_channels=self.group_channels,
-                out_channels=self.group_channels,
-                kernel_size=kernel_size,
-                padding=kernel_size//2,
-                groups=self.group_channels # Depthwise
-            )
+        # Channel-wise Basis Selection: Initialize parameters by group slices
+        with torch.no_grad():
+            # Get parameter views reshaped to (groups, group_channels)
+            # Original params are (channels,), which is (groups * group_channels,)
             
-            # Channel-wise Basis Selection: Initialize branches differently
-            with torch.no_grad():
+            # Helper to get a view for specific parameter
+            def get_view(param):
+                return param.view(groups, self.group_channels)
+            
+            omega_view = get_view(self.layer.omega)
+            sigma_view = get_view(self.layer.sigma)
+            theta_view = get_view(self.layer.theta)
+            
+            for i in range(groups):
                 if i == 0: # Low Frequency
-                    layer.omega.data.uniform_(0, math.pi / 4)
-                    layer.sigma.data.uniform_(2.0, 3.0)
+                    omega_view[i].uniform_(0, math.pi / 4)
+                    sigma_view[i].uniform_(2.0, 3.0)
                 elif i == 1: # High Frequency
-                    layer.omega.data.uniform_(math.pi / 2, math.pi)
-                    layer.sigma.data.uniform_(0.5, 1.0)
+                    omega_view[i].uniform_(math.pi / 2, math.pi)
+                    sigma_view[i].uniform_(0.5, 1.0)
                 elif i == 2: # Oriented Edges (Horizontal/Vertical)
-                    layer.omega.data.uniform_(math.pi / 4, math.pi / 2)
+                    omega_view[i].uniform_(math.pi / 4, math.pi / 2)
                     # Bias theta towards 0 or 90 degrees
-                    thetas = (torch.randint(0, 2, (layer.num_kernels,)).float() * math.pi / 2) + torch.randn(layer.num_kernels) * 0.1
-                    layer.theta.data.copy_(thetas)
+                    thetas = (torch.randint(0, 2, (self.group_channels,)).float() * math.pi / 2) + torch.randn(self.group_channels) * 0.1
+                    theta_view[i].copy_(thetas)
                 else: # Random / Texture
-                    layer.omega.data.uniform_(math.pi / 4, 3 * math.pi / 4)
-                    layer.theta.data.uniform_(0, 2 * math.pi)
-
-            self.branches.append(layer)
+                    omega_view[i].uniform_(math.pi / 4, 3 * math.pi / 4)
+                    theta_view[i].uniform_(0, 2 * math.pi)
 
     def forward(self, x):
         # x: (B, C, H, W)
-        # Split channels into groups
-        x_split = torch.chunk(x, self.groups, dim=1)
-        outputs = []
+        # Apply Complex Wavelet (Single optimized kernel)
+        out_complex = self.layer(x)
         
-        for i, branch in enumerate(self.branches):
-            # Apply Complex Wavelet
-            out_complex = branch(x_split[i])
-            
-            # Compute Magnitude for Shift-Invariance
-            # |z| = sqrt(real^2 + imag^2)
-            # This provides the "approximate shift-invariance" requested.
-            out_mag = torch.abs(out_complex) 
-            outputs.append(out_mag)
-            
-        # Concatenate back to original shape
-        return torch.cat(outputs, dim=1)
+        # Compute Magnitude for Shift-Invariance
+        # |z| = sqrt(real^2 + imag^2)
+        out_mag = torch.abs(out_complex) 
+        
+        return out_mag
