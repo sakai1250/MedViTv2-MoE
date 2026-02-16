@@ -16,3 +16,4 @@ docs/
 nazo/
 caluculated_features/
 *.npy
+medmnistc-api/
