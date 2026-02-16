@@ -15,3 +15,4 @@ checkpoints/
 docs/
 nazo/
 caluculated_features/
+*.npy
