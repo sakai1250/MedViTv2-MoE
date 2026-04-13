@@ -22,18 +22,18 @@
 
 # Datasets to process データセットサイズ順(昇順)
 datasets=(
-    # "breastmnist"
-    # "retinamnist"
-    # "pneumoniamnist"
-    # "dermamnist"
-    "bloodmnist"
-    "organcmnist"
-    "organsmnist"
-    "organamnist"
-    "pathmnist"
-    "octmnist"
-    "chestmnist"
-    "tissuemnist"
+    "breastmnist"
+    "retinamnist"
+    "pneumoniamnist"
+    "dermamnist"
+    # "bloodmnist"
+    # "organcmnist"
+    # "organsmnist"
+    # "organamnist"
+    # "pathmnist"
+    # "octmnist"
+    # "chestmnist"
+    # "tissuemnist"
 )
 
 # Function to run ablation experiments
@@ -47,8 +47,32 @@ run_ablation() {
     # ACKAN
    # echo "MedViTv3_tiny ACKAN" >> "$output_file"
     # CUDA_VISIBLE_DEVICES=$gpu_id python main.py --model_name 'MedViTv3_tiny' --dataset "$dataset" --pretrained True --use_ackan True
-    echo "MedViTv3_tiny ACKAN --enable_local False --enable_global False" >> "$output_file"
-    CUDA_VISIBLE_DEVICES=$gpu_id python main.py --model_name 'MedViTv3_tiny' --dataset "$dataset" --pretrained True --use_ackan True --enable_local False --enable_global False
+    for seed in 42 0 1; do
+        for gate in "True"; do
+            echo "MedViTv2_tiny ACKAN --use_ackan True --use_rkan True --use_gate $gate --seed $seed" >> "$output_file"
+            CUDA_VISIBLE_DEVICES=$gpu_id python main.py --model_name 'MedViT_tiny' --dataset "$dataset" --pretrained True --use_ackan True --use_rkan True --use_gate $gate --seed $seed
+            echo "MedViTv2_tiny ACKAN --use_ackan True --use_rkan False --use_gate $gate --seed $seed" >> "$output_file"
+            CUDA_VISIBLE_DEVICES=$gpu_id python main.py --model_name 'MedViT_tiny' --dataset "$dataset" --pretrained True --use_ackan True --use_rkan False --use_gate $gate --seed $seed
+            echo "MedViTv2_tiny ACKAN --use_ackan False --use_rkan True --use_gate $gate --seed $seed" >> "$output_file"
+            CUDA_VISIBLE_DEVICES=$gpu_id python main.py --model_name 'MedViT_tiny' --dataset "$dataset" --pretrained True --use_ackan False --use_rkan True --use_gate $gate --seed $seed
+            echo "MedViTv2_tiny ACKAN --use_ackan False --use_rkan False --use_gate $gate --seed $seed" >> "$output_file"
+            CUDA_VISIBLE_DEVICES=$gpu_id python main.py --model_name 'MedViT_tiny' --dataset "$dataset" --pretrained True --use_ackan False --use_rkan False --use_gate $gate --seed $seed
+
+            echo "MedViTv2_small ACKAN --use_ackan True --use_rkan True --use_gate $gate --seed $seed" >> "$output_file"
+            CUDA_VISIBLE_DEVICES=$gpu_id python main.py --model_name 'MedViT_small' --dataset "$dataset" --pretrained True --use_ackan True --use_rkan True --use_gate $gate --seed $seed
+            echo "MedViTv2_small ACKAN --use_ackan True --use_rkan False --use_gate $gate --seed $seed" >> "$output_file"
+            CUDA_VISIBLE_DEVICES=$gpu_id python main.py --model_name 'MedViT_small' --dataset "$dataset" --pretrained True --use_ackan True --use_rkan False --use_gate $gate --seed $seed
+            echo "MedViTv2_small ACKAN --use_ackan False --use_rkan True --use_gate $gate --seed $seed" >> "$output_file"
+            CUDA_VISIBLE_DEVICES=$gpu_id python main.py --model_name 'MedViT_small' --dataset "$dataset" --pretrained True --use_ackan False --use_rkan True --use_gate $gate --seed $seed
+            echo "MedViTv2_small ACKAN --use_ackan False --use_rkan False --use_gate $gate --seed $seed" >> "$output_file"
+            CUDA_VISIBLE_DEVICES=$gpu_id python main.py --model_name 'MedViT_small' --dataset "$dataset" --pretrained True --use_ackan False --use_rkan False --use_gate $gate --seed $seed
+        done
+    done
+    # B-Spline KAN
+    # echo "MedViT_tiny BSplineKAN" >> "$output_file"
+    # CUDA_VISIBLE_DEVICES=$gpu_id python main.py --model_name 'MedViT_tiny' --dataset "$dataset" --pretrained True --use_bsplinekan True
+    # echo "MedViT_tiny" >> "$output_file"
+    # CUDA_VISIBLE_DEVICES=$gpu_id python main.py --model_name 'MedViT_tiny' --dataset "$dataset" --pretrained True
     # # Baseline (WavKAN)
     # echo "MedViTv3_tiny Baseline (WavKAN)" >> "$output_file"
     # CUDA_VISIBLE_DEVICES=$gpu_id python main.py --model_name 'MedViTv3_tiny' --dataset "$dataset" --pretrained True --use_ackan True

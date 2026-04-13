@@ -36,7 +36,7 @@ class ComplexGaborConv2d(nn.Module):
         # Phase (Shift): Controls the phase shift
         self.psi = nn.Parameter(torch.rand(self.num_kernels) * 2 * math.pi)
         # Amplitude weight
-        self.weight = nn.Parameter(torch.ones(self.num_kernels))
+        self.weight = nn.Parameter(torch.ones(self.num_kernels)) # shape: (out_channels, in_channels // groups)
 
         # Coordinate grid
         self.register_buffer('grid', self._build_grid(kernel_size))
@@ -57,7 +57,7 @@ class ComplexGaborConv2d(nn.Module):
         omega = self.omega.view(-1, 1, 1)
         theta = self.theta.view(-1, 1, 1)
         psi = self.psi.view(-1, 1, 1)
-        weight = self.weight.view(-1, 1, 1)
+        weight = self.weight.view(-1, 1, 1) # shape: (out_channels, in_channels // groups, 1, 1)
 
         # Rotate coordinates
         x_rot = x * torch.cos(theta) + y * torch.sin(theta)
@@ -157,9 +157,47 @@ class ACKAN(nn.Module):
         # x: (B, C, H, W)
         # Apply Complex Wavelet (Single optimized kernel)
         out_complex = self.layer(x)
-        
+
         # Compute Magnitude for Shift-Invariance
         # |z| = sqrt(real^2 + imag^2)
-        out_mag = torch.abs(out_complex) 
-        
+        out_mag = torch.abs(out_complex)
+
         return out_mag
+
+
+def frequency_diversity_loss(model):
+    """
+    Frequency Diversity Loss (FDL) for AC-KAN.
+
+    Encourages each ACKAN layer to maintain diverse frequency bands across groups
+    by maximizing pairwise distances between group-mean omega values.
+
+    Loss = -mean( |omega_i - omega_j| ) for all i < j pairs across groups,
+           averaged over all ACKAN modules in the model.
+
+    Returns a scalar tensor (0.0 if no ACKAN modules found).
+    """
+    total_loss = torch.tensor(0.0)
+    count = 0
+
+    for module in model.modules():
+        if isinstance(module, ACKAN):
+            omega = module.layer.omega  # (channels,)
+            groups = module.groups
+            group_channels = module.group_channels
+
+            # Mean omega per group: (groups,)
+            omega_mean = omega.view(groups, group_channels).mean(dim=1)
+
+            # Pairwise absolute differences (upper triangle only)
+            diff = omega_mean.unsqueeze(0) - omega_mean.unsqueeze(1)  # (groups, groups)
+            mask = torch.triu(torch.ones(groups, groups, device=omega.device), diagonal=1).bool()
+            pairwise_dists = torch.abs(diff[mask])
+
+            # Minimize negative mean distance = maximize diversity
+            total_loss = total_loss.to(omega.device) - pairwise_dists.mean()
+            count += 1
+
+    if count == 0:
+        return torch.tensor(0.0)
+    return total_loss / count

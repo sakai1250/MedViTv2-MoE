@@ -1,12 +1,19 @@
 """
-Author: Omid Nejati
-Email: omid_nejaty@alumni.iust.ac.ir
+MedViT22: MedViT with Attention-weighted KAN Node Aggregation.
 
-MedViTV2: A Robust Vision Transformer for Generalized Medical Image Classification.
+medvit2_5.py からの差分:
+- KAN のノード集約方式を拡張:
+  - sum: オリジナルの単純加算 (コルモゴロフ・アーノルド表現定理に忠実)
+  - mean: 平均集約 (Altarabichi 2024, "Rethinking the Function of Neurons in KANs")
+  - attention: アテンション重み付け集約 (本研究の提案手法)
+- AttentionAggregationKANLayer: 各gridグループ(エッジ)を分離し、
+  学習可能なアテンション重みで動的に集約
+- 医用画像のノイズ耐性を考慮した工学的拡張
 """
 from functools import partial
 import math
-from fasterkan import FasterKAN as KAN, SplineLinear
+import torch.nn.functional as F
+from fasterkan import FasterKAN as KAN, SplineLinear, ReflectionalSwitchFunction
 from orkan import ORKAN, OKAN
 from rkan import RKAN
 from drkan import DRKAN
@@ -29,10 +36,148 @@ from torch import nn
 import natten
 from natten import NeighborhoodAttention2D as NeighborhoodAttention
 is_natten_post_017 = hasattr(natten, "context")
-#from utils import merge_pre_bn
 
 
 NORM_EPS = 1e-5
+
+
+# ============================================================
+# Attention-weighted KAN Node Aggregation
+# ============================================================
+
+class AttentionAggregationKANLayer(nn.Module):
+    """
+    KAN Layer with configurable node aggregation.
+
+    Standard KAN: node_output = Σ φ_i(x_i)           (sum over edges)
+    Mean KAN:     node_output = (1/K) Σ φ_i(x_i)     (average over edges)
+    Attention:    node_output = Σ α_i · φ_i(x_i)     (attention-weighted)
+      where α_i = softmax(score_net(φ_i(x_i)))
+
+    Each "edge" corresponds to one grid group in the RBF basis.
+    We split the spline computation into K groups (K = num_grids)
+    and aggregate them with learned attention weights.
+    """
+
+    def __init__(
+            self,
+            input_dim: int,
+            output_dim: int,
+            grid_min: float = -2.,
+            grid_max: float = 2.,
+            num_grids: int = 8,
+            exponent: int = 2,
+            denominator: float = 0.33,
+            aggregation_mode: str = 'attention',  # 'sum', 'mean', 'attention'
+            spline_weight_init_scale: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.num_grids = num_grids
+        self.aggregation_mode = aggregation_mode
+
+        self.layernorm = nn.LayerNorm(input_dim)
+        self.rbf = ReflectionalSwitchFunction(grid_min, grid_max, num_grids, exponent, denominator)
+
+        # Per-grid spline linear: each grid group has its own projection
+        # input_dim -> output_dim for each of the K grids
+        self.spline_linears = nn.ModuleList([
+            SplineLinear(input_dim, output_dim, spline_weight_init_scale)
+            for _ in range(num_grids)
+        ])
+
+        # Attention scoring network (only used when aggregation_mode == 'attention')
+        if aggregation_mode == 'attention':
+            self.score_net = nn.Sequential(
+                nn.Linear(output_dim, output_dim // 4 if output_dim >= 16 else 4),
+                nn.ReLU(inplace=True),
+                nn.Linear(output_dim // 4 if output_dim >= 16 else 4, 1),
+            )
+        else:
+            self.score_net = None
+
+    def forward(self, x, time_benchmark=False):
+        # x: (batch, input_dim)
+        if not time_benchmark:
+            normed = self.layernorm(x)
+        else:
+            normed = x
+
+        # Compute RBF basis: (batch, input_dim, num_grids)
+        basis = self.rbf(normed)  # (batch, input_dim, num_grids)
+
+        # Compute per-grid edge outputs
+        # For each grid k: edge_k = spline_linear_k(basis[:, :, k] * normed_features)
+        # basis[:, :, k] is (batch, input_dim) — the k-th basis activation
+        edge_outputs = []
+        for k in range(self.num_grids):
+            # Element-wise: basis activation * input for this grid
+            edge_input = basis[:, :, k]  # (batch, input_dim)
+            edge_out = self.spline_linears[k](edge_input)  # (batch, output_dim)
+            edge_outputs.append(edge_out)
+
+        # Stack: (batch, num_grids, output_dim)
+        edges = torch.stack(edge_outputs, dim=1)
+
+        if self.aggregation_mode == 'sum':
+            # Standard KAN: simple summation
+            output = edges.sum(dim=1)  # (batch, output_dim)
+
+        elif self.aggregation_mode == 'mean':
+            # Mean aggregation (Altarabichi 2024)
+            output = edges.mean(dim=1)  # (batch, output_dim)
+
+        elif self.aggregation_mode == 'attention':
+            # Attention-weighted aggregation
+            # scores: (batch, num_grids, 1)
+            scores = self.score_net(edges)  # (batch, num_grids, 1)
+            # Normalize across grid groups
+            attn_weights = F.softmax(scores, dim=1)  # (batch, num_grids, 1)
+            # Weighted sum
+            output = (attn_weights * edges).sum(dim=1)  # (batch, output_dim)
+        else:
+            raise ValueError(f"Unknown aggregation_mode: {self.aggregation_mode}")
+
+        return output
+
+
+class AttentionKAN(nn.Module):
+    """
+    KAN with Attention-weighted Node Aggregation.
+    Drop-in replacement for FasterKAN with configurable aggregation.
+    """
+
+    def __init__(
+            self,
+            layers_hidden,
+            grid_min: float = -2.,
+            grid_max: float = 2.,
+            num_grids: int = 8,
+            exponent: int = 2,
+            denominator: float = 0.33,
+            aggregation_mode: str = 'attention',
+            spline_weight_init_scale: float = 0.667,
+    ) -> None:
+        super().__init__()
+        self.aggregation_mode = aggregation_mode
+        self.layers = nn.ModuleList([
+            AttentionAggregationKANLayer(
+                in_dim, out_dim,
+                grid_min=grid_min,
+                grid_max=grid_max,
+                num_grids=num_grids,
+                exponent=exponent,
+                denominator=denominator,
+                aggregation_mode=aggregation_mode,
+                spline_weight_init_scale=spline_weight_init_scale,
+            ) for in_dim, out_dim in zip(layers_hidden[:-1], layers_hidden[1:])
+        ])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
 
 
 def merge_pre_bn(module, pre_bn_1, pre_bn_2=None):
@@ -88,7 +233,7 @@ class ConvBNReLU(nn.Module):
         super(ConvBNReLU, self).__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride,
                               padding=1, groups=groups, bias=False)
-        
+
         self.norm = nn.BatchNorm2d(out_channels, eps=NORM_EPS)
         self.act = nn.ReLU(inplace=True)
 
@@ -161,13 +306,13 @@ class CoordAtt(nn.Module):
         self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
         self.bn1 = nn.BatchNorm2d(mip)
         self.act = h_swish()
-        
+
         self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
         self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x):
         identity = x
-        
+
         n,c,h,w = x.size()
         x_h = self.pool_h(x)
         x_w = self.pool_w(x).permute(0, 1, 3, 2)
@@ -175,8 +320,8 @@ class CoordAtt(nn.Module):
         y = torch.cat([x_h, x_w], dim=2)
         y = self.conv1(y)
         y = self.bn1(y)
-        y = self.act(y) 
-        
+        y = self.act(y)
+
         x_h, x_w = torch.split(y, [h, w], dim=2)
         x_w = x_w.permute(0, 1, 3, 2)
 
@@ -251,34 +396,17 @@ class SELayer(nn.Module):
 
 class LocalityFeedForward(nn.Module):
     def __init__(self, in_dim=64, out_dim=96, kernel_size=3, stride=1, expand_ratio=4., act='hs+se', reduction=4,
-                 wo_dp_conv=False, dp_first=False, use_ackan=False, use_bsplinekan=False):
-        """
-        :param in_dim: the input dimension
-        :param out_dim: the output dimension. The input and output dimension should be the same.
-        :param stride: stride of the depth-wise convolution.
-        :param expand_ratio: expansion ratio of the hidden dimension.
-        :param act: the activation function.
-                    relu: ReLU
-                    hs: h_swish
-                    hs+se: h_swish and SE module
-                    hs+eca: h_swish and ECA module
-                    hs+ecah: h_swish and ECA module. Compared with eca, h_sigmoid is used.
-        :param reduction: reduction rate in SE module.
-        :param wo_dp_conv: without depth-wise convolution.
-        :param dp_first: place depth-wise convolution as the first layer.
-        """
+                 wo_dp_conv=False, dp_first=False, use_ackan=False, use_bsplinekan=False,
+                 use_external_residual=False):
         super(LocalityFeedForward, self).__init__()
         hidden_dim = int(in_dim * expand_ratio)
 
-
         layers = []
-        # the first linear layer is replaced by 1x1 convolution.
         layers.extend([
             nn.Conv2d(in_dim, hidden_dim, 1, 1, 0, bias=False),
             nn.BatchNorm2d(hidden_dim),
             h_swish() if act.find('hs') >= 0 else nn.ReLU6(inplace=True)])
 
-        # the depth-wise convolution between the two linear layers
         if not wo_dp_conv:
             if use_bsplinekan and BSplineKAN is not None:
                 dp = [
@@ -312,16 +440,20 @@ class LocalityFeedForward(nn.Module):
             else:
                 raise NotImplementedError('Activation type {} is not implemented'.format(act))
 
-        # the second linear layer is replaced by 1x1 convolution.
         layers.extend([
             nn.Conv2d(hidden_dim, out_dim, 1, 1, 0, bias=False),
             nn.BatchNorm2d(out_dim)
         ])
         self.conv = nn.Sequential(*layers)
+        self.use_external_residual = use_external_residual
 
     def forward(self, x):
-        x = x + self.conv(x)
-        return x
+        if self.use_external_residual:
+            # 残差は呼び出し元(LFP.forward)が担う
+            return self.conv(x)
+        else:
+            # 旧MedViT互換: FFN内部で残差加算（LFP.forwardと二重残差になる）
+            return x + self.conv(x)
 
 
 class Mlp(nn.Module):
@@ -351,15 +483,16 @@ class LFP(nn.Module):
     Efficient Convolution Block
     """
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, path_dropout=0.2,
-                 drop=0, head_dim=32, mlp_ratio=3, use_ackan=False, use_bsplinekan=False, use_gate=False):
+                 drop=0, head_dim=32, mlp_ratio=3, use_ackan=False, use_bsplinekan=False, use_gate=False,
+                 use_external_residual=True):
         super(LFP, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.use_external_residual = use_external_residual
         norm_layer = partial(nn.BatchNorm2d, eps=NORM_EPS)
         assert out_channels % head_dim == 0
 
         self.patch_embed = PatchEmbed(in_channels, out_channels, stride)
-        #self.mhca = MHCA(out_channels, head_dim)
         self.norm1 = norm_layer(out_channels)
         extra_args = {"rel_pos_bias": True} if is_natten_post_017 else {"bias": True}
         self.attn = NeighborhoodAttention(
@@ -374,17 +507,12 @@ class LFP(nn.Module):
             **extra_args,
         )
         self.attention_path_dropout = DropPath(path_dropout)
-        # Gating parameter: output = (1-alpha)*identity + alpha*attn
         self.use_gate = use_gate
-        self.attn_alpha_raw = nn.Parameter(torch.zeros(1)) if use_gate else None  # sigmoid → starts at 0.5
+        self.attn_alpha_raw = nn.Parameter(torch.zeros(1)) if use_gate else None
 
-        self.conv = LocalityFeedForward(out_channels, out_channels, kernel_size, 1, mlp_ratio, reduction=out_channels, use_ackan=use_ackan, use_bsplinekan=use_bsplinekan)
+        self.conv = LocalityFeedForward(out_channels, out_channels, kernel_size, 1, mlp_ratio, reduction=out_channels, use_ackan=use_ackan, use_bsplinekan=use_bsplinekan, use_external_residual=use_external_residual)
 
         self.norm2 = norm_layer(out_channels)
-        #self.mlp = Mlp(out_channels, mlp_ratio=mlp_ratio, drop=drop, bias=True)
-        #self.mlp_path_dropout = DropPath(path_dropout)
-        #hidden_dim = int(out_channels * mlp_ratio)
-        #self.kan = KAN([out_channels, hidden_dim, out_channels])
         self.is_bn_merged = False
 
     def merge_bn(self):
@@ -407,10 +535,7 @@ class LFP(nn.Module):
             out = self.norm2(x)
         else:
             out = x
-        #x = x + self.mlp_path_dropout(self.mlp(out))
-        x = x + self.conv(out) # (B, dim, 14, 14)
-        #b, d, t, _ = out.shape
-        #x = x + self.mlp_path_dropout(self.kan(out.reshape(-1, out.shape[1])).reshape(b, d, t, t))
+        x = x + self.conv(out)
         return x
 
 
@@ -484,16 +609,20 @@ from orkan import ORKAN, OKAN
 from rkan import RKAN
 from drkan import DRKAN
 
-# ... (imports)
 
 class GFP(nn.Module):
     """
-    Local Transformer Block
+    Global-Local Transformer Block.
+
+    parallel_branches=True  (新): patch_embed→split→[MHSA||MHCA]→cat
+    parallel_branches=False (旧): patch_embed(mhsa_ch)→MHSA→projection→MHCA→cat
     """
     def __init__(
             self, in_channels, out_channels, path_dropout, stride=1, sr_ratio=1,
             mlp_ratio=2, head_dim=32, mix_block_ratio=0.75, attn_drop=0, drop=0,
-            use_kmp_glu=False, use_coord=False, use_orkan=False, use_okan=False, use_rkan=False, use_drkan=False
+            use_kmp_glu=False, use_coord=False, use_orkan=False, use_okan=False, use_rkan=False, use_drkan=False,
+            parallel_branches=True,
+            kan_aggregation='sum',
     ):
         super(GFP, self).__init__()
         self.in_channels = in_channels
@@ -505,28 +634,38 @@ class GFP(nn.Module):
         self.use_okan = use_okan
         self.use_rkan = use_rkan
         self.use_drkan = use_drkan
+        self.parallel_branches = parallel_branches
+        self.kan_aggregation = kan_aggregation
         norm_func = partial(nn.BatchNorm2d, eps=NORM_EPS)
 
         self.mhsa_out_channels = _make_divisible(int(out_channels * mix_block_ratio), 32)
         self.mhca_out_channels = out_channels - self.mhsa_out_channels
 
-        self.patch_embed = PatchEmbed(in_channels, self.mhsa_out_channels, stride)
-        self.norm1 = norm_func(self.mhsa_out_channels)
+        if parallel_branches:
+            # 新: out_channels 全体に投影し、あとで split
+            self.patch_embed = PatchEmbed(in_channels, out_channels, stride)
+            self.norm_global = norm_func(self.mhsa_out_channels)
+        else:
+            # 旧: mhsa_out_channels に投影し、逐次処理
+            self.patch_embed = PatchEmbed(in_channels, self.mhsa_out_channels, stride)
+            self.norm_global = norm_func(self.mhsa_out_channels)
+            self.projection = PatchEmbed(self.mhsa_out_channels, self.mhca_out_channels, stride=1)
+
+        # Global Branch (MHSA)
         self.e_mhsa = E_MHSA(self.mhsa_out_channels, head_dim=head_dim, sr_ratio=sr_ratio,
                              attn_drop=attn_drop, proj_drop=drop)
         self.mhsa_path_dropout = DropPath(path_dropout * mix_block_ratio)
 
-        self.projection = PatchEmbed(self.mhsa_out_channels, self.mhca_out_channels, stride=1)
+        # Local Branch (MHCA)
         self.mhca = MHCA(self.mhca_out_channels, head_dim=head_dim, use_coord=use_coord)
         self.mhca_path_dropout = DropPath(path_dropout * (1 - mix_block_ratio))
 
         self.norm2 = norm_func(out_channels)
         self.conv = LocalityFeedForward(out_channels, out_channels, stride=1, expand_ratio=mlp_ratio, reduction=out_channels)
 
-        #self.mlp = Mlp(out_channels, mlp_ratio=mlp_ratio, drop=drop)
         self.mlp_path_dropout = DropPath(path_dropout)
         hidden_dim = int(out_channels * mlp_ratio)
-        
+
         if self.use_drkan:
              self.kan = DRKAN([out_channels, hidden_dim, out_channels])
         elif self.use_rkan:
@@ -535,9 +674,16 @@ class GFP(nn.Module):
              self.kan = OKAN([out_channels, hidden_dim, out_channels])
         elif self.use_orkan:
              self.kan = ORKAN([out_channels, hidden_dim, out_channels])
+        elif self.kan_aggregation in ('mean', 'attention'):
+             # Use AttentionKAN with specified aggregation mode
+             self.kan = AttentionKAN(
+                 [out_channels, hidden_dim, out_channels],
+                 aggregation_mode=self.kan_aggregation,
+             )
         else:
+             # Default: sum aggregation = original FasterKAN
              self.kan = KAN([out_channels, hidden_dim, out_channels])
-             
+
         if self.use_kmp_glu:
             self.mlp = Mlp(out_channels, mlp_ratio=mlp_ratio, drop=drop)
             self.kan_scale = nn.Parameter(torch.zeros(out_channels, 1, 1), requires_grad=True)
@@ -550,10 +696,12 @@ class GFP(nn.Module):
 
     def merge_bn(self):
         if not self.is_bn_merged:
-            self.e_mhsa.merge_bn(self.norm1)
+            self.e_mhsa.merge_bn(self.norm_global)
             if self.use_kmp_glu and self.mlp is not None:
                 self.mlp.merge_bn(self.norm2)
             self.is_bn_merged = True
+
+
 
     def reset_stats(self):
         self._alpha_sum = 0.0
@@ -580,31 +728,46 @@ class GFP(nn.Module):
     def forward(self, x):
         x = self.patch_embed(x)
         B, C, H, W = x.shape
-        if not torch.onnx.is_in_onnx_export() and not self.is_bn_merged:
-            out = self.norm1(x)
+
+        if self.parallel_branches:
+            # --- 新: 並列処理 ---
+            x_global, x_local = torch.split(x, [self.mhsa_out_channels, self.mhca_out_channels], dim=1)
+
+            if not torch.onnx.is_in_onnx_export() and not self.is_bn_merged:
+                out_global = self.norm_global(x_global)
+            else:
+                out_global = x_global
+            out_global = rearrange(out_global, "b c h w -> b (h w) c")
+            out_global = self.e_mhsa(out_global)
+            x_global = x_global + self.mhsa_path_dropout(rearrange(out_global, "b (h w) c -> b c h w", h=H))
+
+            x_local = x_local + self.mhca_path_dropout(self.mhca(x_local))
+            x = torch.cat([x_global, x_local], dim=1)
         else:
-            out = x
-        out = rearrange(out, "b c h w -> b (h w) c")  # b n c
-        out = self.mhsa_path_dropout(self.e_mhsa(out))
-        x = x + rearrange(out, "b (h w) c -> b c h w", h=H)
+            # --- 旧: 逐次処理 ---
+            if not torch.onnx.is_in_onnx_export() and not self.is_bn_merged:
+                out = self.norm_global(x)
+            else:
+                out = x
+            out = rearrange(out, "b c h w -> b (h w) c")
+            out = self.mhsa_path_dropout(self.e_mhsa(out))
+            x = x + rearrange(out, "b (h w) c -> b c h w", h=H)
 
-        out = self.projection(x)
-        out = out + self.mhca_path_dropout(self.mhca(out))
-        x = torch.cat([x, out], dim=1)
+            out = self.projection(x)
+            out = out + self.mhca_path_dropout(self.mhca(out))
+            x = torch.cat([x, out], dim=1)
 
+        # 6. FFN (KAN / MLP)
         if not torch.onnx.is_in_onnx_export() and not self.is_bn_merged:
             out = self.norm2(x)
         else:
             out = x
-        #x = x + self.conv(out)
-        #x = x + self.mlp_path_dropout(self.mlp(out))
+
         if self.use_kmp_glu:
             b, d, h, w = out.shape
             kan_out = self.kan(out.permute(0, 2, 3, 1).reshape(-1, d))
             kan_out = kan_out.view(b, h, w, d).permute(0, 3, 1, 2)
             mlp_out = self.mlp(out)
-            
-            # LayerScale: Initialize with 0 contribution from KAN
             fused = mlp_out + self.kan_scale * kan_out
             x = x + self.mlp_path_dropout(fused)
         else:
@@ -618,7 +781,9 @@ class MedViT(nn.Module):
                  dims=[64, 128, 320, 512], path_dropout=0.1, attn_drop=0,
                  drop=0, num_classes=1000,
                  strides=[1, 2, 2, 2], sr_ratios=[8, 4, 2, 1], head_dim=32, mix_block_ratio=0.75,
-                 use_checkpoint=False, use_kmp_glu=False, use_coord=False, use_wavkan=False, use_orkan=False, use_okan=False, use_rkan=False, use_drkan=False, use_ackan=False, ackan_stages=[0, 1, 2, 3], use_bsplinekan=False, bsplinekan_stages=[0, 1, 2, 3], use_gate=False, **kwargs):
+                 use_checkpoint=False, use_kmp_glu=False, use_coord=False, use_wavkan=False, use_orkan=False, use_okan=False, use_rkan=False, use_drkan=False, use_ackan=False, ackan_stages=[0, 1, 2, 3], use_bsplinekan=False, bsplinekan_stages=[0, 1, 2, 3], use_gate=False,
+                 parallel_gfp=True, external_lfp_residual=True,
+                 kan_aggregation='sum', **kwargs):
         super(MedViT, self).__init__()
         self.use_checkpoint = use_checkpoint
         self.use_kmp_glu = use_kmp_glu
@@ -630,6 +795,9 @@ class MedViT(nn.Module):
         self.use_ackan = use_ackan
         self.use_bsplinekan = use_bsplinekan
         self.use_gate = use_gate
+        self.parallel_gfp = parallel_gfp
+        self.external_lfp_residual = external_lfp_residual
+        self.kan_aggregation = kan_aggregation
         self.gfp_layers = []
 
         self.stage_out_channels = [[dims[0]] * (depths[0]),
@@ -637,7 +805,6 @@ class MedViT(nn.Module):
                                    [dims[2], dims[2], dims[2]] * (depths[2] // 3),
                                    [dims[3]] * (depths[3])]
 
-        # Next Hybrid Strategy
         self.stage_block_types = [[LFP] * depths[0],
                                   [LFP] * (depths[1] - 1) + [GFP],
                                   [LFP, LFP, GFP] * (depths[2] // 3),
@@ -652,7 +819,7 @@ class MedViT(nn.Module):
         input_channel = stem_chs[-1]
         features = []
         idx = 0
-        dpr = [x.item() for x in torch.linspace(0, path_dropout, sum(depths))]  # stochastic depth decay rule
+        dpr = [x.item() for x in torch.linspace(0, path_dropout, sum(depths))]
         for stage_id in range(len(depths)):
             kernel=7 if stage_id == 0 else 3
             numrepeat = depths[stage_id]
@@ -669,7 +836,8 @@ class MedViT(nn.Module):
                     layer = LFP(input_channel, output_channel, stride=stride, kernel_size=kernel, path_dropout=dpr[idx + block_id],
                                 drop=drop, head_dim=head_dim, use_ackan=self.use_ackan and (stage_id in ackan_stages),
                                 use_bsplinekan=self.use_bsplinekan and (stage_id in bsplinekan_stages),
-                                use_gate=self.use_gate)
+                                use_gate=self.use_gate,
+                                use_external_residual=self.external_lfp_residual)
                     features.append(layer)
                 elif block_type is GFP:
                     layer = GFP(input_channel, output_channel, path_dropout=dpr[idx + block_id], stride=stride,
@@ -678,20 +846,21 @@ class MedViT(nn.Module):
                                 use_orkan=self.use_orkan,
                                 use_okan=self.use_okan,
                                 use_rkan=self.use_rkan,
-                                use_drkan=self.use_drkan)
+                                use_drkan=self.use_drkan,
+                                parallel_branches=self.parallel_gfp,
+                                kan_aggregation=self.kan_aggregation)
                     features.append(layer)
                     self.gfp_layers.append(layer)
                 input_channel = output_channel
             idx += numrepeat
         self.features = nn.Sequential(*features)
 
-        # LFP→GFP transition safety valve (Gabor + RKAN combination)
         self.transition_norms = nn.ModuleDict()
         if use_ackan and (use_rkan or use_drkan):
             for i in range(len(features) - 1):
                 if isinstance(features[i], LFP) and isinstance(features[i+1], GFP):
                     ch = features[i].out_channels
-                    self.transition_norms[str(i)] = nn.GroupNorm(1, ch)  # GroupNorm(1,C) == LayerNorm
+                    self.transition_norms[str(i)] = nn.GroupNorm(1, ch)
 
         self.norm = nn.BatchNorm2d(output_channel, eps=NORM_EPS)
 
@@ -764,8 +933,6 @@ class MedViT(nn.Module):
             elif isinstance(m, nn.Linear):
                 if isinstance(m, SplineLinear):
                     continue
-                # Skip ORKAN components if they are Linear (unlikely but safe)
-                # But ORKAN uses nn.Parameter mostly.
                 trunc_normal_(m.weight, std=.02)
                 if hasattr(m, 'bias') and m.bias is not None:
                     nn.init.constant_(m.bias, 0)
@@ -774,7 +941,6 @@ class MedViT(nn.Module):
                 if hasattr(m, 'bias') and m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, (ORKAN, OKAN, RKAN, DRKAN)):
-                # ORKAN/OKAN/RKAN has its own initialization
                 continue
             elif ACKAN is not None and isinstance(m, ACKAN):
                 continue
@@ -788,11 +954,8 @@ class MedViT(nn.Module):
                 x = checkpoint.checkpoint(layer, x)
             else:
                 x = layer(x)
-            # LFP→GFP transition: LayerNorm 
             if str(idx) in self.transition_norms:
-                # identity = x
                 x = self.transition_norms[str(idx)](x)
-                # x = identity + x
         x = self.norm(x)
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
@@ -800,7 +963,7 @@ class MedViT(nn.Module):
         return x
 
 @register_model
-def MedViT_tiny(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay= None, **kwargs):
+def MedViT22_tiny(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay=None, **kwargs):
     model = MedViT(stem_chs=[64, 32, 64],
                    depths=[2, 2, 6, 1],
                    dims=[64, 128, 192, 384],
@@ -808,25 +971,23 @@ def MedViT_tiny(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay= N
     return model
 
 @register_model
-def MedViT_small(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay= None, **kwargs):
+def MedViT22_small(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay=None, **kwargs):
     model = MedViT(stem_chs=[64, 32, 64],
                    depths=[2, 2, 6, 2],
                    dims=[64, 128, 256, 512],
                    path_dropout=0.1, **kwargs)
     return model
 
-
 @register_model
-def MedViT_base(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay= None, **kwargs):
+def MedViT22_base(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay=None, **kwargs):
     model = MedViT(stem_chs=[64, 32, 64],
                    depths=[2, 2, 6, 2],
                    dims=[96, 192, 384, 768],
                    path_dropout=0.2, **kwargs)
     return model
 
-
 @register_model
-def MedViT_large(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay= None, **kwargs):
+def MedViT22_large(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay=None, **kwargs):
     model = MedViT(stem_chs=[64, 32, 64],
                    depths=[2, 2, 6, 2],
                    dims=[96, 256, 512, 1024],

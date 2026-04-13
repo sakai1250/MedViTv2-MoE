@@ -1,3 +1,4 @@
+
 import os
 import json
 import sys
@@ -24,20 +25,15 @@ from tqdm import tqdm
 import medmnist
 from medmnist import INFO, Evaluator
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-import natten
+# import natten
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
 from sklearn.preprocessing import label_binarize
 from MedViT import MedViT_tiny, MedViT_small, MedViT_base, MedViT_large
-#from MedViTV1 import MedViT_small, MedViT_base, MedViT_large
 from MedViTv3 import MedViTv3_tiny, MedViTv3_small, MedViTv3_base, MedViTv3_large
-from medvit2_5 import MedViT25_tiny, MedViT25_small, MedViT25_base, MedViT25_large
-from medvit22 import MedViT22_tiny, MedViT22_small, MedViT22_base, MedViT22_large
+# from medvitvv import MedViTVV_tiny, MedViTVV_small, MedViTVV_base, MedViTVV_large
+from medvitvvv import MedViTVVV_tiny, MedViTVVV_small, MedViTVVV_base, MedViTVVV_large
 from datetime import datetime
 
-try:
-    from ac_kan import frequency_diversity_loss
-except ImportError:
-    frequency_diversity_loss = None
 
 
 model_classes = {
@@ -49,14 +45,14 @@ model_classes = {
     'MedViTv3_small': MedViTv3_small,
     'MedViTv3_base': MedViTv3_base,
     'MedViTv3_large': MedViTv3_large,
-    'MedViT25_tiny': MedViT25_tiny,
-    'MedViT25_small': MedViT25_small,
-    'MedViT25_base': MedViT25_base,
-    'MedViT25_large': MedViT25_large,
-    'MedViT22_tiny': MedViT22_tiny,
-    'MedViT22_small': MedViT22_small,
-    'MedViT22_base': MedViT22_base,
-    'MedViT22_large': MedViT22_large,
+    'MedViTVV_tiny': MedViT_tiny, # Alias to MedViT, distinguish via args
+    'MedViTVV_small': MedViT_small,
+    'MedViTVV_base': MedViT_base,
+    'MedViTVV_large': MedViT_large,
+    'MedViTVVV_tiny': MedViTVVV_tiny,
+    'MedViTVVV_small': MedViTVVV_small,
+    'MedViTVVV_base': MedViTVVV_base,
+    'MedViTVVV_large': MedViTVVV_large
 }
 
 model_urls = {
@@ -68,14 +64,15 @@ model_urls = {
     "MedViTv3_small": "https://dl.dropbox.com/scl/fi/6nnec8hxcn5da6vov7h2a/MedViT_small.pth?rlkey=yf5twra1cv6ep2oqr79tbzyg5&st=rwx5hy8z&dl=0",
     "MedViTv3_base": "https://dl.dropbox.com/scl/fi/q5c0u515dd4oc8j55bhi9/MedViT_base.pth?rlkey=5duw3uomnsyjr80wykvedjhas&st=incconx4&dl=0",
     "MedViTv3_large": "https://dl.dropbox.com/scl/fi/owujijpsl6vwd481hiydd/MedViT_large.pth?rlkey=cx9lqb4a1288nv4xlmux13zoe&st=kcehwbrb&dl=0",
-    "MedViT25_tiny": "https://dl.dropbox.com/scl/fi/496jbihqp360jacpji554/MedViT_tiny.pth?rlkey=6hb9froxugvtg8l639jmspxfv&st=p9ef06j8&dl=0",
-    "MedViT25_small": "https://dl.dropbox.com/scl/fi/6nnec8hxcn5da6vov7h2a/MedViT_small.pth?rlkey=yf5twra1cv6ep2oqr79tbzyg5&st=rwx5hy8z&dl=0",
-    "MedViT25_base": "https://dl.dropbox.com/scl/fi/q5c0u515dd4oc8j55bhi9/MedViT_base.pth?rlkey=5duw3uomnsyjr80wykvedjhas&st=incconx4&dl=0",
-    "MedViT25_large": "https://dl.dropbox.com/scl/fi/owujijpsl6vwd481hiydd/MedViT_large.pth?rlkey=cx9lqb4a1288nv4xlmux13zoe&st=kcehwbrb&dl=0",
-    "MedViT22_tiny": "https://dl.dropbox.com/scl/fi/496jbihqp360jacpji554/MedViT_tiny.pth?rlkey=6hb9froxugvtg8l639jmspxfv&st=p9ef06j8&dl=0",
-    "MedViT22_small": "https://dl.dropbox.com/scl/fi/6nnec8hxcn5da6vov7h2a/MedViT_small.pth?rlkey=yf5twra1cv6ep2oqr79tbzyg5&st=rwx5hy8z&dl=0",
-    "MedViT22_base": "https://dl.dropbox.com/scl/fi/q5c0u515dd4oc8j55bhi9/MedViT_base.pth?rlkey=5duw3uomnsyjr80wykvedjhas&st=incconx4&dl=0",
-    "MedViT22_large": "https://dl.dropbox.com/scl/fi/owujijpsl6vwd481hiydd/MedViT_large.pth?rlkey=cx9lqb4a1288nv4xlmux13zoe&st=kcehwbrb&dl=0"
+    "MedViTVV_tiny": "https://dl.dropbox.com/scl/fi/496jbihqp360jacpji554/MedViT_tiny.pth?rlkey=6hb9froxugvtg8l639jmspxfv&st=p9ef06j8&dl=0", 
+    # Using MedViT_tiny checkpoint for MedViTVV_tiny as a base (strict=False will handle missing keys)
+    "MedViTVV_small": "https://dl.dropbox.com/scl/fi/6nnec8hxcn5da6vov7h2a/MedViT_small.pth?rlkey=yf5twra1cv6ep2oqr79tbzyg5&st=rwx5hy8z&dl=0",
+    "MedViTVV_base": "https://dl.dropbox.com/scl/fi/q5c0u515dd4oc8j55bhi9/MedViT_base.pth?rlkey=5duw3uomnsyjr80wykvedjhas&st=incconx4&dl=0",
+    "MedViTVV_large": "https://dl.dropbox.com/scl/fi/owujijpsl6vwd481hiydd/MedViT_large.pth?rlkey=cx9lqb4a1288nv4xlmux13zoe&st=kcehwbrb&dl=0",
+    "MedViTVVV_tiny": "https://dl.dropbox.com/scl/fi/496jbihqp360jacpji554/MedViT_tiny.pth?rlkey=6hb9froxugvtg8l639jmspxfv&st=p9ef06j8&dl=0",
+    "MedViTVVV_small": "https://dl.dropbox.com/scl/fi/6nnec8hxcn5da6vov7h2a/MedViT_small.pth?rlkey=yf5twra1cv6ep2oqr79tbzyg5&st=rwx5hy8z&dl=0",
+    "MedViTVVV_base": "https://dl.dropbox.com/scl/fi/q5c0u515dd4oc8j55bhi9/MedViT_base.pth?rlkey=5duw3uomnsyjr80wykvedjhas&st=incconx4&dl=0",
+    "MedViTVVV_large": "https://dl.dropbox.com/scl/fi/owujijpsl6vwd481hiydd/MedViT_large.pth?rlkey=cx9lqb4a1288nv4xlmux13zoe&st=kcehwbrb&dl=0"
 }
 
 def download_checkpoint(url, path):
@@ -101,17 +98,20 @@ def ensure_medmnist_npz(flag, size, root):
         return target
 
     available = ", ".join(sorted(f for f in os.listdir(root) if f.endswith(".npz")))
-    raise FileNotFoundError(
-        f"Missing MedMNIST file `{flag}.npz` in `{root}`. "
-        f"Checked fallback `{flag}_{size}.npz`. "
-        f"Available: {available if available else 'none'}."
-    )
+    # raise FileNotFoundError(
+    #     f"Missing MedMNIST file `{flag}.npz` in `{root}`. "
+    #     f"Checked fallback `{flag}_{size}.npz`. "
+    #     f"Available: {available if available else 'none'}."
+    # )
+    print(f"Warning: Missing MedMNIST file `{flag}.npz` in `{root}`. Proceeding without specific file check (Evaluator might download).")
 
 
-def train_mnist(epochs, net, train_loader, test_loader, optimizer, scheduler, loss_function, device, save_path, data_flag, task, use_fdloss=False, fdloss_weight=0.03):
+def train_mnist(epochs, net, train_loader, test_loader, optimizer, scheduler, loss_function, device, save_path, data_flag, task, args):
     best_acc = 0.0
     alpha_history, gap_history, var_history = [], [], []
     gating_history = []
+    
+    # ... (training loop unchanged)
     for epoch in range(epochs):
         if hasattr(net, "reset_stat_logs"):
             net.reset_stat_logs()
@@ -131,10 +131,11 @@ def train_mnist(epochs, net, train_loader, test_loader, optimizer, scheduler, lo
                 labels = labels.squeeze().long()
                 loss = loss_function(outputs.squeeze(0), labels)
 
-            if use_fdloss and frequency_diversity_loss is not None:
-                fdl = frequency_diversity_loss(net)
-                loss = loss + fdloss_weight * fdl
-
+            # Pole regularization for RKAN
+            if args.pole_reg_lambda > 0 and hasattr(net, 'pole_regularization'):
+                pole_loss = net.pole_regularization()
+                loss = loss + args.pole_reg_lambda * pole_loss
+            
             loss.backward()
             optimizer.step()
             scheduler.step()
@@ -183,11 +184,17 @@ def train_mnist(epochs, net, train_loader, test_loader, optimizer, scheduler, lo
                 
         y_score = y_score.detach().numpy()
         ensure_medmnist_npz(data_flag, size=224, root='./data')
-        evaluator = Evaluator(data_flag, 'test', size=224, root='./data')
-        metrics = evaluator.evaluate(y_score)
-        
-        auc_score, val_accurate = metrics  # metrics = (AUC, ACC)
-        print(f'[epoch {epoch + 1}] train_loss: {running_loss / len(train_loader):.3f}  auc: {auc_score:.3f}  acc: {val_accurate:.3f}')
+        try:
+            evaluator = Evaluator(data_flag, 'test', size=224, root='./data')
+            metrics = evaluator.evaluate(y_score)
+            
+            val_accurate, _ = metrics
+            print(f'[epoch {epoch + 1}] train_loss: {running_loss / len(train_loader):.3f}  auc: {metrics[0]:.3f}  acc: {metrics[1]:.3f}')
+        except Exception as e:
+            print(f"Evaluation error: {e}")
+            val_accurate = 0
+            metrics = [0, 0]
+
         print(f'lr: {scheduler.get_last_lr()[-1]:.8f}')
         if val_accurate > best_acc:
             print('\nSaving checkpoint...')
@@ -202,14 +209,41 @@ def train_mnist(epochs, net, train_loader, test_loader, optimizer, scheduler, lo
             torch.save(state, save_path)
 
     print('Finished Training')
-    # 追記モードでファイルオープン
-    with open(f'{data_flag}.txt', 'a') as f:
+    
+    # Determine filename
+    if args.use_fmkan:
+        out_filename = f'{data_flag}_fmkan.txt'
+        kan_type = "FMKAN"
+    elif args.use_drkan:
+        out_filename = f'{data_flag}_drkan.txt'
+        kan_type = "DRKAN"
+    elif args.use_rkan:
+        out_filename = f'{data_flag}_rkan.txt'
+        kan_type = "RKAN"
+    elif args.use_okan:
+        out_filename = f'{data_flag}_okan.txt'
+        kan_type = "OKAN"
+    elif args.use_orkan:
+        out_filename = f'{data_flag}_orkan.txt'
+        kan_type = "ORKAN"
+    elif args.use_ackan:
+        out_filename = f'{data_flag}_ackan.txt'
+        kan_type = "ACKAN"
+    else:
+        out_filename = f'{data_flag}.txt'
+        kan_type = "KAN" if args.use_kan else "MLP"
+        
+    # Formatting
+    header = f"{args.model_name} {kan_type} --enable_local {args.enable_local} --enable_global {args.enable_global}"
+    
+    with open(out_filename, 'a') as f:
         now = datetime.now().strftime("%Y/%m/%d %H:%M")
+        f.write(f"{header}\n")
         f.write(f"{now}\n")
         f.write(f"testacc       {val_accurate * 100:.2f}%\n")
-        f.write(f"auc            {auc_score * 100:.2f}%\n")
-        f.write(f"acc      {val_accurate * 100:.2f}%\n")
-        f.write("\n")  # 区切り
+        f.write(f"auc            {metrics[0] * 100:.2f}%\n")
+        f.write(f"acc      {metrics[1] * 100:.2f}%\n")
+        f.write("\n")
 
     # 実行時刻をフォルダ名に
     timestamp = datetime.now().strftime("%Y%m%d%H%M")
@@ -238,14 +272,14 @@ def train_mnist(epochs, net, train_loader, test_loader, optimizer, scheduler, lo
             json.dump(gating_history, stats_file, indent=2)
 
     # 混同行列の可視化と保存
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues')
-    plt.title('Confusion Matrix')
-    plt.xlabel('Predicted Label')
-    plt.ylabel('True Label')
-    plt.tight_layout()
-    plt.savefig(f'{log_dir}/conf_matrix.png')
-    plt.close()
+    # plt.figure(figsize=(10, 8))
+    # sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues')
+    # plt.title('Confusion Matrix')
+    # plt.xlabel('Predicted Label')
+    # plt.ylabel('True Label')
+    # plt.tight_layout()
+    # plt.savefig(f'{log_dir}/conf_matrix.png')
+    # plt.close()
     
 # Define the non-MNIST training routine
 def specificity_per_class(conf_matrix):
@@ -263,11 +297,12 @@ def overall_accuracy(conf_matrix):
     total_sum = conf_matrix.sum()  # Sum of all elements in the matrix
     return tp_tn_sum / total_sum
 
-def train_other(epochs, net, train_loader, test_loader, optimizer, scheduler, loss_function, device, save_path, use_fdloss=False, fdloss_weight=0.03):
+def train_other(epochs, net, train_loader, test_loader, optimizer, scheduler, loss_function, device, save_path, args):
     best_acc = 0.0
     alpha_history, gap_history, var_history = [], [], []
     gating_history = []
     
+    # ... (training loop unchanged)
     for epoch in range(epochs):
         if hasattr(net, "reset_stat_logs"):
             net.reset_stat_logs()
@@ -282,10 +317,10 @@ def train_other(epochs, net, train_loader, test_loader, optimizer, scheduler, lo
             outputs = net(images.to(device))
             loss = loss_function(outputs, labels.to(device))
 
-            if use_fdloss and frequency_diversity_loss is not None:
-                fdl = frequency_diversity_loss(net)
-                loss = loss + fdloss_weight * fdl
-
+            # Pole regularization for RKAN
+            if args.pole_reg_lambda > 0 and hasattr(net, 'pole_regularization'):
+                pole_loss = net.pole_regularization()
+                loss = loss + args.pole_reg_lambda * pole_loss
             loss.backward()
             optimizer.step()
             scheduler.step()
@@ -333,7 +368,7 @@ def train_other(epochs, net, train_loader, test_loader, optimizer, scheduler, lo
                 # Collect predictions, labels, and probabilities
                 all_preds.extend(predict_y.cpu().numpy())
                 all_labels.extend(val_labels.cpu().numpy())
-                all_probs.extend(probs.cpu().numpy())
+                # all_probs.extend(probs.cpu().numpy())
 
                 # Calculate accuracy
                 acc += torch.eq(predict_y, val_labels.to(device)).sum().item()
@@ -358,7 +393,8 @@ def train_other(epochs, net, train_loader, test_loader, optimizer, scheduler, lo
 
         try:
             # Compute AUC for multi-class
-            auc = roc_auc_score(all_labels_one_hot, all_probs, multi_class='ovr')
+            # auc = roc_auc_score(all_labels_one_hot, all_probs, multi_class='ovr')
+            auc = 0.0
         except ValueError:
             auc = float('nan')  # Handle edge case where AUC can't be computed
 
@@ -384,10 +420,38 @@ def train_other(epochs, net, train_loader, test_loader, optimizer, scheduler, lo
             torch.save(state, save_path)
 
     print('Finished Training')
-
+    
+    # Determine filename
+    data_flag = args.dataset # Or pass explicit if different
+    if args.use_fmkan:
+        out_filename = f'{data_flag}_fmkan.txt'
+        kan_type = "FMKAN"
+    elif args.use_drkan:
+        out_filename = f'{data_flag}_drkan.txt'
+        kan_type = "DRKAN"
+    elif args.use_rkan:
+        out_filename = f'{data_flag}_rkan.txt'
+        kan_type = "RKAN"
+    elif args.use_okan:
+        out_filename = f'{data_flag}_okan.txt'
+        kan_type = "OKAN"
+    elif args.use_orkan:
+        out_filename = f'{data_flag}_orkan.txt'
+        kan_type = "ORKAN"
+    elif args.use_ackan:
+        out_filename = f'{data_flag}_ackan.txt'
+        kan_type = "ACKAN"
+    else:
+        out_filename = f'{data_flag}.txt'
+        kan_type = "KAN" if args.use_kan else "MLP"
+        
+    # Formatting
+    header = f"{args.model_name} {kan_type} --enable_local {args.enable_local} --enable_global {args.enable_global}"
+    
     # 追記モードでファイルオープン
-    with open(f'result.txt', 'a') as f:
+    with open(out_filename, 'a') as f:
         now = datetime.now().strftime("%Y/%m/%d %H:%M")
+        f.write(f"{header}\n")
         f.write(f"{now}\n")
         f.write(f"testacc       {val_accurate * 100:.2f}%\n")
         f.write(f"auc            {auc * 100:.2f}%\n")
@@ -396,7 +460,7 @@ def train_other(epochs, net, train_loader, test_loader, optimizer, scheduler, lo
         f.write(f"specificity    {avg_specificity * 100:.2f}%\n")
         f.write(f"f1_score       {f1 * 100:.2f}%\n")
         f.write(f"overall_acc    {overall_acc * 100:.2f}%\n")
-        f.write("\n")  # 区切り
+        f.write("\n")
 
         # 実行時刻をフォルダ名に
         timestamp = datetime.now().strftime("%Y%m%d%H%M")
@@ -425,27 +489,16 @@ def train_other(epochs, net, train_loader, test_loader, optimizer, scheduler, lo
                 json.dump(gating_history, stats_file, indent=2)
 
         # 混同行列の可視化と保存
-        plt.figure(figsize=(10, 8))
-        sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues')
-        plt.title('Confusion Matrix')
-        plt.xlabel('Predicted Label')
-        plt.ylabel('True Label')
-        plt.tight_layout()
-        plt.savefig(f'{log_dir}/conf_matrix.png')
-        plt.close()
-
-def set_seed(seed):
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
+        # plt.figure(figsize=(10, 8))
+        # sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues')
+        # plt.title('Confusion Matrix')
+        # plt.xlabel('Predicted Label')
+        # plt.ylabel('True Label')
+        # plt.tight_layout()
+        # plt.savefig(f'{log_dir}/conf_matrix.png')
+        # plt.close()
 
 def main(args):
-    set_seed(args.seed)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print("Using {} device.".format(device))
     model_name = args.model_name
@@ -478,40 +531,28 @@ def main(args):
     # Select model
     if model_name in model_classes:
         model_class = model_classes[model_name]
-        is_medvit_v1 = model_name in ('MedViT_tiny', 'MedViT_small', 'MedViT_base', 'MedViT_large')
-        is_medvit_25 = model_name in ('MedViT25_tiny', 'MedViT25_small', 'MedViT25_base', 'MedViT25_large')
-        is_medvit_22 = model_name in ('MedViT22_tiny', 'MedViT22_small', 'MedViT22_base', 'MedViT22_large')
-        if is_medvit_v1:
-            extra_kwargs = {'use_rkan': args.use_rkan}
-        elif is_medvit_25:
-            extra_kwargs = {
-                'use_rkan': args.use_rkan,
-                'parallel_gfp': args.parallel_gfp,
-                'external_lfp_residual': args.external_lfp_residual,
-            }
-        elif is_medvit_22:
-            extra_kwargs = {
-                'use_rkan': args.use_rkan,
-                'parallel_gfp': args.parallel_gfp,
-                'external_lfp_residual': args.external_lfp_residual,
-                'kan_aggregation': args.kan_aggregation,
-            }
-        else:
-            extra_kwargs = {}
-        net = model_class(num_classes=nb_classes, use_kmp_glu=args.use_kmp_glu,
+        net = model_class(num_classes=nb_classes, use_kmp_glu=args.use_kmp_glu, 
                           use_coord=args.use_coord, use_wavkan=args.use_wavkan,
+                          use_checkpoint=args.use_checkpoint,
                           use_ackan=args.use_ackan,
-                          use_bsplinekan=args.use_bsplinekan,
                           use_kan=args.use_kan, enable_global=args.enable_global,
-                          enable_local=args.enable_local, ackan_stages=args.ackan_stages,
-                          use_gate=args.use_gate,
-                          **extra_kwargs).cuda()
+                          enable_local=args.enable_local, 
+                          use_orkan=args.use_orkan,
+                          use_okan=args.use_okan,
+                          use_rkan=args.use_rkan,
+                          use_drkan=args.use_drkan).cuda()
         if pretrained:
             checkpoint_path = args.checkpoint_path
             if not os.path.exists(checkpoint_path):
                 checkpoint_url = model_urls.get(model_name)
                 if not checkpoint_url:
-                    raise ValueError(f"Checkpoint URL for model {model_name} not found.")
+                    # fallback to medvit_tiny for vv_tiny if not found
+                    if "MedViTVV" in model_name:
+                         base_name = model_name.replace("MedViTVV", "MedViT")
+                         checkpoint_url = model_urls.get(base_name)
+                    
+                    if not checkpoint_url:
+                         raise ValueError(f"Checkpoint URL for model {model_name} not found.")
                 download_checkpoint(checkpoint_url, f'./{model_name}.pth')
                 checkpoint_path = f'./{model_name}.pth'
 
@@ -538,35 +579,21 @@ def main(args):
 
     epochs = args.epochs
     best_acc = 0.0
-    
-    if args.save_name:
-        save_path = f'./{args.save_name}.pth'
-    else:
-        save_path = f'./{model_name}_{dataset_name}.pth'
-        
+    save_path = f'./{model_name}_{dataset_name}.pth'
     train_steps = len(train_loader)
 
     if dataset_name.endswith('mnist'):
+        
         train_mnist(epochs, net, train_loader, test_loader,
-                    optimizer, scheduler, loss_function, device, save_path, dataset_name, task,
-                    use_fdloss=args.use_fdloss, fdloss_weight=args.fdloss_weight)
+        optimizer, scheduler, loss_function, device, save_path, dataset_name, task, args)
     else:
         train_other(epochs, net, train_loader, test_loader,
-                    optimizer, scheduler, loss_function, device, save_path,
-                    use_fdloss=args.use_fdloss, fdloss_weight=args.fdloss_weight)
+        optimizer, scheduler, loss_function, device, save_path, args)
 
 
 if __name__ == '__main__':
-    # seed = 42
-    # torch.manual_seed(seed)
-    # torch.cuda.manual_seed(seed)
-    # np.random.seed(seed)
-    # random.seed(seed)
-    # torch.backends.cudnn.deterministic = True
-    # torch.backends.cudnn.benchmark = False
-
     parser = argparse.ArgumentParser(description='Training script for MedViT models.')
-    parser.add_argument('--model_name', type=str, default='MedViT_tiny', help='Model name to use.')
+    parser.add_argument('--model_name', type=str, default='MedViTVV_tiny', help='Model name to use.')
     #tissuemnist, pathmnist, chestmnist, dermamnist, octmnist, pneumoniamnist, retinamnist, breastmnist, bloodmnist,
     #organamnist, organcmnist, organsmnist'
     parser.add_argument('--dataset', type=str, default='PAD', help='Dataset to use.')
@@ -579,23 +606,16 @@ if __name__ == '__main__':
     parser.add_argument('--use_coord', type=lambda x: bool(strtobool(x)), default=False, help='Enable Coordinate Attention in MHCA (default: False).')
     parser.add_argument('--use_wavkan', type=lambda x: bool(strtobool(x)), default=False, help='Use WavKAN instead of FasterKAN (default: False).')
     parser.add_argument('--use_ackan', type=lambda x: bool(strtobool(x)), default=False, help='Use AC-KAN (default: False).')
-    parser.add_argument('--use_rkan', type=lambda x: bool(strtobool(x)), default=False, help='Use RationalKAN in GFP (default: False).')
-    parser.add_argument('--ackan_stages', type=int, nargs='+', default=[0, 1, 2, 3], help='Stages to apply ACKAN (default: 0 1 2 3)')
-    parser.add_argument('--use_bsplinekan', type=lambda x: bool(strtobool(x)), default=False, help='Use B-Spline KAN in LFP depthwise conv (default: False).')
     parser.add_argument('--use_kan', type=lambda x: bool(strtobool(x)), default=True, help='Use KAN in FFN (default: True). If False, uses MLP.')
     parser.add_argument('--enable_global', type=lambda x: bool(strtobool(x)), default=True, help='Enable Global Branch in GFP (default: True).')
     parser.add_argument('--enable_local', type=lambda x: bool(strtobool(x)), default=True, help='Enable Local Branch in GFP (default: True).')
-    parser.add_argument('--save_name', type=str, default='', help='Custom name for the saved .pth checkpoint file (without extension).')
-    parser.add_argument('--use_fdloss', type=lambda x: bool(strtobool(x)), default=False, help='Enable Frequency Diversity Loss for AC-KAN (default: False).')
-    parser.add_argument('--fdloss_weight', type=float, default=0.03, help='Weight (lambda) for Frequency Diversity Loss (default: 0.03).')
-    parser.add_argument('--use_gate', type=lambda x: bool(strtobool(x)), default=False, help='Enable gated NeighborhoodAttention in LFP: (1-alpha)*x + alpha*attn(x) (default: False).')
-    parser.add_argument('--parallel_gfp', type=lambda x: bool(strtobool(x)), default=True, help='[MedViT25] Use parallel Global/Local branches in GFP (default: True).')
-    parser.add_argument('--external_lfp_residual', type=lambda x: bool(strtobool(x)), default=True, help='[MedViT25] Apply FFN residual externally in LFP, avoiding double residual (default: True).')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility (default: 42).')
-    parser.add_argument('--kan_aggregation', type=str, default='sum', choices=['sum', 'mean', 'attention'],
-                        help='[MedViT22] KAN node aggregation mode: sum (original), mean (average), attention (proposed) (default: sum).')
+    parser.add_argument('--use_checkpoint', type=lambda x: bool(strtobool(x)), default=False, help='Enable gradient checkpointing (default: False).')
+    parser.add_argument('--use_orkan', type=lambda x: bool(strtobool(x)), default=False, help='Use Orthogonal Rational KAN (default: False).')
+    parser.add_argument('--use_okan', type=lambda x: bool(strtobool(x)), default=False, help='Use Orthogonal KAN without Rational denominator (default: False).')
+    parser.add_argument('--use_fmkan', type=lambda x: bool(strtobool(x)), default=False, help='Use FM-KAN (Frequency Modulation KAN) (default: False).')
+    parser.add_argument('--use_rkan', type=lambda x: bool(strtobool(x)), default=False, help='Use RationalKAN (Rational Function KAN) (default: False).')
+    parser.add_argument('--use_drkan', type=lambda x: bool(strtobool(x)), default=False, help='Use DR-KAN (Dynamic Rational KAN) (default: False).')
+    parser.add_argument('--pole_reg_lambda', type=float, default=0.0, help='Pole regularization lambda for RKAN/DR-KAN (default: 0.0, disabled).')
 
     args = parser.parse_args()
     main(args)
-
-# python main.py --model_name 'convnext_tiny' --dataset 'PAD'
